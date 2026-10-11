@@ -4,6 +4,7 @@ use flutter_rust_bridge::frb;
 use minotari_wallet::{
     db::get_displayed_transactions_paginated, get_accounts, utils::timestamp::format_timestamp,
 };
+use tari_common_types::{payment_reference::generate_payment_reference, types::FixedHash};
 /// Fee charged on a transaction: `amount` in **microTari** plus a pre-formatted
 /// `amount_display` string for the UI.
 #[frb]
@@ -152,6 +153,49 @@ pub struct DisplayedTransactionDto {
 
 impl From<minotari_wallet::DisplayedTransaction> for DisplayedTransactionDto {
     fn from(t: minotari_wallet::DisplayedTransaction) -> Self {
+        // Incoming receipts need references for our received outputs, even when
+        // the sender's optional memo contains no sent_output_hashes.
+        let mut payrefs = Vec::new();
+        let is_mined = t.blockchain.block_height > 0
+            && t.blockchain.block_hash != FixedHash::zero()
+            && !matches!(
+                t.status,
+                minotari_wallet::transactions::TransactionDisplayStatus::Reorganized
+                    | minotari_wallet::transactions::TransactionDisplayStatus::Cancelled
+                    | minotari_wallet::transactions::TransactionDisplayStatus::Rejected
+            );
+        if is_mined {
+            if matches!(
+                t.direction,
+                minotari_wallet::transactions::TransactionDirection::Incoming
+            ) {
+                for output in &t.details.outputs {
+                    if !output.is_change
+                        && output.mined_in_block_height == t.blockchain.block_height
+                        && output.mined_in_block_hash == t.blockchain.block_hash
+                        && output.hash != FixedHash::zero()
+                    {
+                        let reference =
+                            generate_payment_reference(&output.mined_in_block_hash, &output.hash)
+                                .to_string();
+                        if !payrefs.contains(&reference) {
+                            payrefs.push(reference);
+                        }
+                    }
+                }
+            }
+            // Retain the existing send/coinbase path when no received output
+            // can be reconstructed from this history entry.
+            if payrefs.is_empty() {
+                payrefs = t
+                    .details
+                    .sent_payrefs
+                    .iter()
+                    .filter(|reference| **reference != FixedHash::zero())
+                    .map(ToString::to_string)
+                    .collect();
+            }
+        }
         Self {
             id: t.id.to_string(),
             direction: t.direction.into(),
@@ -163,12 +207,7 @@ impl From<minotari_wallet::DisplayedTransaction> for DisplayedTransactionDto {
             counterparty: t.counterparty.map(CounterpartyInfoDto::from),
             blockchain: t.blockchain.into(),
             fee: t.fee.map(FeeInfoDto::from),
-            payrefs: t
-                .details
-                .sent_payrefs
-                .iter()
-                .map(|fixed_hash| fixed_hash.to_string())
-                .collect(),
+            payrefs,
         }
     }
 }
@@ -204,9 +243,138 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use minotari_wallet::models::OutputStatus;
     use minotari_wallet::transactions::{
-        TransactionDirection, TransactionDisplayStatus, TransactionSource,
+        BlockchainInfo, TransactionDetails, TransactionDirection, TransactionDisplayStatus,
+        TransactionOutput, TransactionSource,
     };
+    use tari_transaction_components::{
+        tari_amount::MicroMinotari, transaction_components::OutputType,
+    };
+    use tari_utilities::hex::Hex;
+
+    const RECEIVED_PAYREF: &str =
+        "9cb2bb582664d051387c2d40ed638be2d7d98226b64ced71f90827a8e73f5a1a";
+
+    fn received_transaction() -> minotari_wallet::DisplayedTransaction {
+        // Public output/block hashes from the funded integration wallet, also
+        // checked against the explorer. No wallet keys or seed are required.
+        let block_hash =
+            FixedHash::from_hex("35222fd500aae8c471b37885dcded36767afde6ea7609daaedbbe9e01a47b442")
+                .unwrap();
+        let output_hash =
+            FixedHash::from_hex("d672aebab31aa1cf521ddc1f85ba93587e6393acc1fca0a810f01c38211c3683")
+                .unwrap();
+        minotari_wallet::DisplayedTransaction {
+            id: 42_u64.into(),
+            direction: TransactionDirection::Incoming,
+            source: TransactionSource::Transfer,
+            status: TransactionDisplayStatus::Unconfirmed,
+            amount: MicroMinotari(100_000_000),
+            message: None,
+            counterparty: None,
+            blockchain: BlockchainInfo {
+                block_height: 363574,
+                timestamp: chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc(),
+                confirmations: 0,
+                block_hash,
+            },
+            fee: None,
+            details: TransactionDetails {
+                account_id: 1,
+                total_credit: MicroMinotari(100_000_000),
+                total_debit: MicroMinotari(0),
+                inputs: vec![],
+                outputs: vec![TransactionOutput {
+                    hash: output_hash,
+                    amount: MicroMinotari(100_000_000),
+                    status: OutputStatus::Unspent,
+                    mined_in_block_height: 363574,
+                    mined_in_block_hash: block_hash,
+                    output_type: OutputType::Standard,
+                    is_change: false,
+                }],
+                output_type: None,
+                coinbase_extra: None,
+                memo_hex: None,
+                sent_output_hashes: vec![],
+                sent_payrefs: vec![],
+            },
+            lock_height: 0,
+        }
+    }
+
+    #[test]
+    fn incoming_without_sent_payrefs_exports_the_explorer_reference() {
+        let dto = DisplayedTransactionDto::from(received_transaction());
+        assert_eq!(dto.payrefs, vec![RECEIVED_PAYREF]);
+        assert_eq!(dto.id, "42");
+        assert!(matches!(
+            dto.status,
+            DisplayedTransactionStatus::Unconfirmed
+        ));
+    }
+
+    #[test]
+    fn incoming_exports_all_received_outputs_without_change_or_duplicates() {
+        let mut tx = received_transaction();
+        let first = tx.details.outputs[0].clone();
+        let mut second = first.clone();
+        second.hash = FixedHash::from([2_u8; 32]);
+        let second_reference =
+            generate_payment_reference(&second.mined_in_block_hash, &second.hash).to_string();
+        let mut change = first.clone();
+        change.hash = FixedHash::from([3_u8; 32]);
+        change.is_change = true;
+        tx.details.outputs.extend([first, second, change]);
+        tx.details.sent_payrefs.push(FixedHash::from([7_u8; 32]));
+        assert_eq!(
+            DisplayedTransactionDto::from(tx).payrefs,
+            vec![RECEIVED_PAYREF.to_string(), second_reference]
+        );
+    }
+
+    #[test]
+    fn unmined_or_removed_transactions_have_no_current_payrefs() {
+        let mut unmined = received_transaction();
+        unmined.blockchain.block_height = 0;
+        assert!(DisplayedTransactionDto::from(unmined).payrefs.is_empty());
+
+        let mut unknown_block = received_transaction();
+        unknown_block.blockchain.block_hash = FixedHash::zero();
+        assert!(DisplayedTransactionDto::from(unknown_block)
+            .payrefs
+            .is_empty());
+
+        for status in [
+            TransactionDisplayStatus::Reorganized,
+            TransactionDisplayStatus::Cancelled,
+            TransactionDisplayStatus::Rejected,
+        ] {
+            let mut tx = received_transaction();
+            tx.status = status;
+            tx.details.sent_payrefs.push(FixedHash::from([8_u8; 32]));
+            assert!(DisplayedTransactionDto::from(tx).payrefs.is_empty());
+        }
+
+        let mut stale_output = received_transaction();
+        stale_output.details.outputs[0].mined_in_block_hash = FixedHash::from([9_u8; 32]);
+        assert!(DisplayedTransactionDto::from(stale_output)
+            .payrefs
+            .is_empty());
+    }
+
+    #[test]
+    fn outgoing_preserves_sent_references_instead_of_our_received_outputs() {
+        let mut tx = received_transaction();
+        tx.direction = TransactionDirection::Outgoing;
+        let reference = FixedHash::from([8_u8; 32]);
+        tx.details.sent_payrefs = vec![reference];
+        assert_eq!(
+            DisplayedTransactionDto::from(tx).payrefs,
+            vec![reference.to_string()]
+        );
+    }
 
     #[test]
     fn direction_maps_exhaustively() {
