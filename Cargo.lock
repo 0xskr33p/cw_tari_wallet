@@ -939,7 +939,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d162beedaa69905488a8da94f5ac3edb4dd4788b732fadb7bd120b2625c1976"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.111",
 ]
 
 [[package]]
@@ -1731,7 +1731,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.1",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -2239,8 +2239,8 @@ dependencies = [
 
 [[package]]
 name = "minotari"
-version = "0.2.0"
-source = "git+https://github.com/tari-project/minotari-cli.git?rev=af78477479166e21c7fb98d0e7d8d5b28d70c903#af78477479166e21c7fb98d0e7d8d5b28d70c903"
+version = "0.3.0"
+source = "git+https://github.com/tari-project/minotari-cli.git?tag=v0.3.0#d71622c95e812a963eb5592c875cae00d3e316fe"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2292,8 +2292,8 @@ dependencies = [
 
 [[package]]
 name = "minotari-scanning"
-version = "0.2.0"
-source = "git+https://github.com/tari-project/minotari-cli.git?rev=af78477479166e21c7fb98d0e7d8d5b28d70c903#af78477479166e21c7fb98d0e7d8d5b28d70c903"
+version = "0.3.0"
+source = "git+https://github.com/tari-project/minotari-cli.git?tag=v0.3.0#d71622c95e812a963eb5592c875cae00d3e316fe"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2326,9 +2326,9 @@ dependencies = [
 
 [[package]]
 name = "minotari_app_grpc"
-version = "5.7.0-pre.8"
+version = "6.0.1-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4fa18e955af2e5db38656bcfc4cbdfdc2f52224a7eaf0fa60135c605f13ac6f"
+checksum = "bacdb841e32a6b069feb896e998435b9b8fb36220d676f78db01bf474711ab71"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -2344,7 +2344,6 @@ dependencies = [
  "tari_max_size",
  "tari_node_components",
  "tari_script",
- "tari_sidechain",
  "tari_transaction_components",
  "tari_utilities",
  "thiserror 2.0.17",
@@ -2356,9 +2355,9 @@ dependencies = [
 
 [[package]]
 name = "minotari_ledger_wallet_common"
-version = "5.7.0-pre.8"
+version = "6.0.1-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d0989ac957d754aa0b8b531c1ea69070659350e4aa5dc82ef336f69fe4971f3"
+checksum = "f86ea7a763dca5b53d0d0b80947c9423e5153f8d8aead646ff0b4a26215500d8"
 dependencies = [
  "borsh",
  "bs58",
@@ -2883,7 +2882,7 @@ version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -3898,9 +3897,9 @@ dependencies = [
 
 [[package]]
 name = "tari_common"
-version = "5.7.0-pre.8"
+version = "6.0.1-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e75dbd275de2ef744dde446cef55ee817c9975ad756f0d9fada1c3a10dba314"
+checksum = "870b8a4650ec1b153d2dd754b98d52d830ddaf4288cd68e1563b96cad36a952c"
 dependencies = [
  "anyhow",
  "cargo_toml",
@@ -3921,9 +3920,9 @@ dependencies = [
 
 [[package]]
 name = "tari_common_types"
-version = "5.7.0-pre.8"
+version = "6.0.1-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0a24434012a43e2449f03423197a55b44395a645795f7339efbca2f897e265b"
+checksum = "cd136e3631ef00d218ad19305dd37fb42e4a8aa3ba217be606ae89d53f25789b"
 dependencies = [
  "argon2",
  "base64 0.22.1",
@@ -3959,9 +3958,9 @@ dependencies = [
 
 [[package]]
 name = "tari_crypto"
-version = "0.23.3"
+version = "0.23.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6199ba947fcb817563df50146ba0968f0f725990ed1bce2ee6534b4d8bf7c90f"
+checksum = "a6ef628e3b35f65425c44323d38106b51bf4312e8ddaacd0a0178c5dd588653e"
 dependencies = [
  "blake2 0.10.6",
  "borsh",
@@ -3981,15 +3980,15 @@ dependencies = [
 
 [[package]]
 name = "tari_features"
-version = "5.7.0-pre.8"
+version = "6.0.1-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "799652caf0cc72be10afabc2abeb6406e63e23023b0c87d6b01dde66796d0e89"
+checksum = "292068df1adb8f4cb009bda9c2b92be460ba01d5e6ef2e547a143bc0bf8a529e"
 
 [[package]]
 name = "tari_hashing"
-version = "5.7.0-pre.8"
+version = "6.0.1-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1dfdd7c99f842cda33376d5f8714f5b3e6209aec1284a3627f55e2f4af25be22"
+checksum = "ab7d3bb6fe15e8817ccdeb823069ace98121d68a539bbd9bd0a42a9b4943013a"
 dependencies = [
  "blake2 0.10.6",
  "borsh",
@@ -3999,9 +3998,9 @@ dependencies = [
 
 [[package]]
 name = "tari_jellyfish"
-version = "5.7.0-pre.8"
+version = "6.0.1-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fef176712a5e7642a4d826b34bd9f5d5d5818ad9960eca5010a6f12cc9d9ded"
+checksum = "d432dfea274a55fc9933af3ff75c17cbe38c32f7762b9034f10ff728c6d118ba"
 dependencies = [
  "borsh",
  "digest 0.10.7",
@@ -4014,9 +4013,9 @@ dependencies = [
 
 [[package]]
 name = "tari_max_size"
-version = "5.7.0-pre.8"
+version = "6.0.1-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a1b5d59ba3d7c70112648b678c20985d0d20b7c346ca7af7d3e6d52da6ef2153"
+checksum = "3069d95261b5974ae135709b9f2d1c9a6b77e191d816ecabc0486429b891bed4"
 dependencies = [
  "borsh",
  "serde",
@@ -4037,10 +4036,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "tari_node_components"
-version = "5.7.0-pre.8"
+name = "tari_mmr"
+version = "6.0.1-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8be4ff38f9e9f6395d13ee643d6f7310bd258065a979f1af3f40ce44c6e9485"
+checksum = "a7ba8982849e48d2358ad9ad7a7b4901a55418deeda49c71cb799902cc32a90f"
+dependencies = [
+ "borsh",
+ "digest 0.10.7",
+ "serde",
+ "tari_crypto",
+ "tari_utilities",
+ "thiserror 2.0.17",
+]
+
+[[package]]
+name = "tari_node_components"
+version = "6.0.1-pre.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4819f0ada6ae547c7947632314f3a86d22737fe99dedd565e05a34c4eafd39b3"
 dependencies = [
  "blake2 0.10.6",
  "borsh",
@@ -4059,9 +4072,9 @@ dependencies = [
 
 [[package]]
 name = "tari_script"
-version = "5.7.0-pre.8"
+version = "6.0.1-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b443e73e887fe107e5caa9d5cfc9b1b6e8dd727b0760a39641a923c4c3d417f7"
+checksum = "18fb6e6faa0a145c19f2885488cf418f74e75058822ba61b79b465f44c731274"
 dependencies = [
  "blake2 0.10.6",
  "borsh",
@@ -4078,9 +4091,9 @@ dependencies = [
 
 [[package]]
 name = "tari_sidechain"
-version = "5.7.0-pre.8"
+version = "6.0.1-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8181afddbee6f12d59d6ae097cbc1915f2b4dadd1baeb9e39e4cb719a06d2ee"
+checksum = "74df93906163d028b8d32fb77b93c56a91506a37e44ad83877df33375463296b"
 dependencies = [
  "borsh",
  "hex",
@@ -4096,9 +4109,9 @@ dependencies = [
 
 [[package]]
 name = "tari_transaction_components"
-version = "5.7.0-pre.8"
+version = "6.0.1-pre.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "191a787d575052ab0bd22463fd8eaba002d3685002811faecb68790f0de72821"
+checksum = "0eca74aed83ca31fe8e7a8ca3329f601f880271500df59b4f7f73460377abd42"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4131,8 +4144,8 @@ dependencies = [
  "tari_crypto",
  "tari_hashing",
  "tari_max_size",
+ "tari_mmr",
  "tari_script",
- "tari_sidechain",
  "tari_utilities",
  "thiserror 2.0.17",
  "utoipa",

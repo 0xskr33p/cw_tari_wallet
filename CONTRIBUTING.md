@@ -178,9 +178,14 @@ the frozen contract. Never bypass it on a dependency PR.
   producer* (it compiles to the native libs linked by the Flutter app), not a
   reusable library — so the lockfile is the reproducible-build record, not noise to
   be ignored. A reusable library would `.gitignore` it; we must not.
-- `minotari` is pinned by **git rev**; `tari_common` / `tari_common_types` /
-  `tari_transaction_components` are pinned to `5.7.0-pre.8` pre-releases;
+- `minotari` is pinned to the **v0.3.0 git tag** (resolved commit is recorded in
+  `Cargo.lock`); `tari_common` / `tari_common_types` / `tari_hashing` /
+  `tari_transaction_components` are pinned exactly to `=6.0.1-pre.2`;
   `flutter_rust_bridge` is pinned **exactly** `=2.11.1`.
+- Keep the transitive `tari_*` crates on the same `6.0.1-pre.2` release in
+  `Cargo.lock`. Resolving some of them to `6.1.0` mixes incompatible
+  `tari_crypto` types. Use the committed lockfile (`--locked`) for builds and
+  tests, including native iOS/Android builds.
 
 ### FRB runtime ↔ codegen CLI lockstep
 
@@ -225,7 +230,7 @@ process is:
    (function, class/enum, field, variant) means the bump leaked a contract change —
    revert, or promote to a MAJOR only via a coordinated migration (see below).
 
-Pre-release `tari_*` (`5.7.0-pre.8`) can change shape between pre-releases — never
+Pre-release `tari_*` (`6.0.1-pre.2`) can change shape between pre-releases — never
 auto-merge a `tari_*` bump.
 
 ### Dependency-update automation (Renovate)
