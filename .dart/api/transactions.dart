@@ -6,6 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
+// These functions are ignored because they are not marked as `pub`: `refresh_mined_status`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `clone`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `fmt`, `from`, `from`, `from`, `from`, `from`, `from`, `from`
 
 /// List a page of the wallet's transactions, most recent first.
@@ -19,6 +20,16 @@ Future<List<DisplayedTransactionDto>> getTransactions(
         required PlatformInt64 offset}) =>
     RustLib.instance.api.crateApiTransactionsGetTransactions(
         walletName: walletName, limit: limit, offset: offset);
+
+/// Refresh mined Pending/Unconfirmed/Locked entries using this account's scanned tip.
+///
+/// Workaround for minotari 0.3.0's skipped transaction monitor, matching Universe.
+/// Call between scan cycles. Unmined sends and removed transactions are preserved.
+/// Returns changed entries; existing scan events and read APIs are unchanged.
+Future<List<DisplayedTransactionDto>> refreshTransactionConfirmations(
+        {required String walletName, BigInt? requiredConfirmations}) =>
+    RustLib.instance.api.crateApiTransactionsRefreshTransactionConfirmations(
+        walletName: walletName, requiredConfirmations: requiredConfirmations);
 
 /// Where a transaction sits on chain: `block_height`, a formatted `timestamp`
 /// string, and the number of `confirmations` (blocks) on top of it.

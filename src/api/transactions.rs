@@ -2,7 +2,13 @@ use crate::api::{db::get_db_connection, error::WalletError, utils::format_micro_
 use anyhow::Result;
 use flutter_rust_bridge::frb;
 use minotari_wallet::{
-    db::get_displayed_transactions_paginated, get_accounts, utils::timestamp::format_timestamp,
+    db::{
+        get_displayed_transactions_needing_confirmation_update,
+        get_displayed_transactions_paginated, get_latest_scanned_tip_block_by_account,
+        update_displayed_transaction_confirmations,
+    },
+    get_accounts,
+    utils::timestamp::format_timestamp,
 };
 use tari_common_types::{payment_reference::generate_payment_reference, types::FixedHash};
 /// Fee charged on a transaction: `amount` in **microTari** plus a pre-formatted
@@ -232,6 +238,77 @@ pub fn get_transactions(
     Ok(transactions.into_iter().map(Into::into).collect())
 }
 
+/// Refresh mined Pending/Unconfirmed/Locked entries using this account's scanned tip.
+///
+/// Workaround for minotari 0.3.0's skipped transaction monitor, matching Universe.
+/// Call between scan cycles. Unmined sends and removed transactions are preserved.
+/// Returns changed entries; existing scan events and read APIs are unchanged.
+#[frb]
+pub fn refresh_transaction_confirmations(
+    wallet_name: String,
+    required_confirmations: Option<u64>,
+) -> Result<Vec<DisplayedTransactionDto>> {
+    let required =
+        required_confirmations.unwrap_or(crate::api::config::DEFAULT_CONFIRMATION_WINDOW);
+    anyhow::ensure!(
+        required > 0,
+        "Required confirmations must be greater than zero"
+    );
+    let mut conn = get_db_connection()?;
+    let account = get_accounts(&mut conn, Some(&wallet_name))?
+        .into_iter()
+        .next()
+        .ok_or(WalletError::NoAccounts)?;
+    let snapshot = conn.transaction()?;
+    let Some(tip) = get_latest_scanned_tip_block_by_account(&snapshot, account.id)? else {
+        return Ok(Vec::new());
+    };
+    let mut updated = Vec::new();
+    for mut tx in get_displayed_transactions_needing_confirmation_update(&snapshot, account.id)? {
+        if refresh_mined_status(&mut tx, tip.height, required) {
+            update_displayed_transaction_confirmations(&snapshot, &tx)?;
+            updated.push(tx.into());
+        }
+    }
+    snapshot.commit()?;
+    Ok(updated)
+}
+
+fn refresh_mined_status(
+    tx: &mut minotari_wallet::DisplayedTransaction,
+    scanned_height: u64,
+    required: u64,
+) -> bool {
+    use minotari_wallet::transactions::TransactionDisplayStatus as Status;
+    if !matches!(
+        tx.status,
+        Status::Pending | Status::Unconfirmed | Status::Locked
+    ) || tx.blockchain.block_height == 0
+        || tx.blockchain.block_height > scanned_height
+        || tx.blockchain.block_hash == FixedHash::zero()
+    {
+        return false;
+    }
+    let confirmations = scanned_height.saturating_sub(tx.blockchain.block_height);
+    let status = if confirmations >= required {
+        if tx.lock_height > scanned_height {
+            Status::Locked
+        } else {
+            Status::Confirmed
+        }
+    } else if confirmations > 0 {
+        Status::Unconfirmed
+    } else {
+        Status::Pending
+    };
+    if confirmations == tx.blockchain.confirmations && status == tx.status {
+        return false;
+    }
+    tx.blockchain.confirmations = confirmations;
+    tx.status = status;
+    true
+}
+
 #[cfg(test)]
 mod tests {
     //! Enum-mapping tests. Pure conversions, no I/O. These are upstream-drift
@@ -255,6 +332,61 @@ mod tests {
 
     const RECEIVED_PAYREF: &str =
         "9cb2bb582664d051387c2d40ed638be2d7d98226b64ced71f90827a8e73f5a1a";
+
+    #[test]
+    fn mined_receipt_crosses_confirmation_threshold_and_keeps_its_reference() {
+        let mut tx = received_transaction();
+        assert!(refresh_mined_status(&mut tx, 363576, 3));
+        assert_eq!(tx.blockchain.confirmations, 2);
+        assert_eq!(tx.status, TransactionDisplayStatus::Unconfirmed);
+        assert!(refresh_mined_status(&mut tx, 363577, 3));
+        assert_eq!(tx.status, TransactionDisplayStatus::Confirmed);
+        assert_eq!(
+            DisplayedTransactionDto::from(tx).payrefs,
+            vec![RECEIVED_PAYREF]
+        );
+    }
+
+    #[test]
+    fn mined_lock_stays_locked_until_its_height_and_can_change_status_only() {
+        let mut tx = received_transaction();
+        tx.lock_height = 363580;
+        assert!(refresh_mined_status(&mut tx, 363577, 3));
+        assert_eq!(tx.status, TransactionDisplayStatus::Locked);
+        assert!(!refresh_mined_status(&mut tx, 363577, 3));
+        assert!(refresh_mined_status(&mut tx, 363580, 3));
+        assert_eq!(tx.status, TransactionDisplayStatus::Confirmed);
+        tx.status = TransactionDisplayStatus::Unconfirmed;
+        assert!(refresh_mined_status(&mut tx, 363580, 3));
+        assert_eq!(tx.status, TransactionDisplayStatus::Confirmed);
+    }
+
+    #[test]
+    fn unmined_unknown_or_removed_entries_are_not_promoted() {
+        for status in [
+            TransactionDisplayStatus::Cancelled,
+            TransactionDisplayStatus::Rejected,
+            TransactionDisplayStatus::Reorganized,
+            TransactionDisplayStatus::Confirmed,
+        ] {
+            let mut tx = received_transaction();
+            tx.status = status;
+            assert!(!refresh_mined_status(&mut tx, 363714, 3));
+            assert_eq!(tx.status, status);
+            assert_eq!(tx.blockchain.confirmations, 0);
+        }
+        let mut tx = received_transaction();
+        tx.direction = TransactionDirection::Outgoing;
+        tx.blockchain.block_height = 0;
+        tx.status = TransactionDisplayStatus::Pending;
+        assert!(!refresh_mined_status(&mut tx, 363714, 3));
+        assert_eq!(tx.status, TransactionDisplayStatus::Pending);
+        tx.blockchain.block_height = 363715;
+        assert!(!refresh_mined_status(&mut tx, 363714, 3));
+        tx.blockchain.block_height = 363574;
+        tx.blockchain.block_hash = FixedHash::zero();
+        assert!(!refresh_mined_status(&mut tx, 363714, 3));
+    }
 
     fn received_transaction() -> minotari_wallet::DisplayedTransaction {
         // Public output/block hashes from the funded integration wallet, also
