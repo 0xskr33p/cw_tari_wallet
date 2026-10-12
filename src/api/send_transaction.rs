@@ -3,6 +3,7 @@ use crate::api::db::{get_db_connection, get_db_pool};
 use crate::api::error::WalletError;
 use crate::api::network::{apply_network, parse_network, TariNetwork};
 use crate::api::transactions::DisplayedTransactionDto;
+use crate::domain::history::{kernel_fee, normalize_local_send};
 use crate::domain::keys::key_manager_from_seed_words;
 use crate::domain::validation::{validate_send_inputs, ValidatedInputs};
 use crate::frb_generated::StreamSink;
@@ -168,6 +169,13 @@ where
         }
     };
 
+    let actual_fee = match kernel_fee(&signed_transaction.signed_transaction.transaction) {
+        Ok(fee) => fee,
+        Err(error) => {
+            release_send_reservation(&idempotency_key);
+            return Err(error);
+        }
+    };
     report(TransactionStage::Broadcasting, "Broadcasting to network...");
 
     let base_url = details
@@ -175,7 +183,7 @@ where
         .take()
         .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
 
-    let result_tx = match sender
+    let mut result_tx = match sender
         .finalize_transaction_and_broadcast(signed_transaction, base_url)
         .await
     {
@@ -188,6 +196,7 @@ where
 
     report(TransactionStage::Completed, "Transaction sent");
 
+    normalize_local_send(&mut result_tx, actual_fee);
     Ok(result_tx.into())
 }
 

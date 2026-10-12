@@ -1,5 +1,6 @@
 use crate::api::{db::get_db_connection, error::WalletError, utils::format_micro_tari};
-use anyhow::Result;
+use crate::domain::history::{kernel_fee, normalize_local_send};
+use anyhow::{Context, Result};
 use flutter_rust_bridge::frb;
 use minotari_wallet::{
     db::{
@@ -10,7 +11,10 @@ use minotari_wallet::{
     get_accounts,
     utils::timestamp::format_timestamp,
 };
+use r2d2_sqlite::rusqlite::{Connection, OptionalExtension};
 use tari_common_types::{payment_reference::generate_payment_reference, types::FixedHash};
+use tari_transaction_components::transaction_components::Transaction;
+use tari_utilities::ByteArray;
 /// Fee charged on a transaction: `amount` in **microTari** plus a pre-formatted
 /// `amount_display` string for the UI.
 #[frb]
@@ -190,8 +194,24 @@ impl From<minotari_wallet::DisplayedTransaction> for DisplayedTransactionDto {
                     }
                 }
             }
-            // Retain the existing send/coinbase path when no received output
-            // can be reconstructed from this history entry.
+            // Pending sends were built with a zero block hash, so their stored
+            // references are provisional. Rebuild from the actual mined block
+            // and the recipient output hashes, never from our change outputs.
+            if matches!(
+                t.direction,
+                minotari_wallet::transactions::TransactionDirection::Outgoing
+            ) {
+                payrefs = t
+                    .details
+                    .sent_output_hashes
+                    .iter()
+                    .filter(|hash| **hash != FixedHash::zero())
+                    .map(|hash| {
+                        generate_payment_reference(&t.blockchain.block_hash, hash).to_string()
+                    })
+                    .collect();
+            }
+            // Retain references for entries that have no sent output hashes.
             if payrefs.is_empty() {
                 payrefs = t
                     .details
@@ -235,7 +255,83 @@ pub fn get_transactions(
 
     let transactions = get_displayed_transactions_paginated(&conn, account.id, limit, offset)?;
 
-    Ok(transactions.into_iter().map(Into::into).collect())
+    transactions
+        .into_iter()
+        .map(|tx| history_dto(&conn, tx))
+        .collect()
+}
+
+fn restore_mined_block_hash(
+    conn: &Connection,
+    tx: &mut minotari_wallet::DisplayedTransaction,
+) -> Result<bool> {
+    use minotari_wallet::transactions::TransactionDisplayStatus as Status;
+    if tx.blockchain.block_hash != FixedHash::zero()
+        || tx.blockchain.block_height == 0
+        || matches!(
+            tx.status,
+            Status::Reorganized | Status::Cancelled | Status::Rejected
+        )
+    {
+        return Ok(false);
+    }
+    let Ok(height) = i64::try_from(tx.blockchain.block_height) else {
+        return Ok(false);
+    };
+    let mut hash: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT hash FROM scanned_tip_blocks WHERE account_id = ?1 AND height = ?2 LIMIT 1",
+            (tx.details.account_id, height),
+            |row| row.get(0),
+        )
+        .optional()?;
+    // Old scanned blocks may have been pruned. A matched wallet output (usually
+    // the change) retains the public hash of its mined block.
+    if hash
+        .as_ref()
+        .is_none_or(|h| h.iter().all(|byte| *byte == 0))
+    {
+        for output in &tx.details.outputs {
+            hash = conn.query_row(
+                "SELECT mined_in_block_hash FROM outputs WHERE account_id = ?1
+                 AND output_hash = ?2 AND mined_in_block_height = ?3 AND deleted_at IS NULL LIMIT 1",
+                (tx.details.account_id, output.hash.as_bytes(), height), |row| row.get(0),
+            ).optional()?;
+            if hash
+                .as_ref()
+                .is_some_and(|h| h.iter().any(|byte| *byte != 0))
+            {
+                break;
+            }
+        }
+    }
+    if let Some(hash) = hash {
+        let hash =
+            FixedHash::try_from(hash).context("Invalid mined block hash in wallet history")?;
+        if hash != FixedHash::zero() {
+            tx.blockchain.block_hash = hash;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn history_dto(
+    conn: &Connection,
+    mut tx: minotari_wallet::DisplayedTransaction,
+) -> Result<DisplayedTransactionDto> {
+    restore_mined_block_hash(conn, &mut tx)?;
+    if tx.direction == minotari_wallet::transactions::TransactionDirection::Outgoing {
+        if let Some(completed) = minotari_wallet::db::get_completed_transaction_by_id(conn, tx.id)?
+        {
+            if completed.account_id == tx.details.account_id {
+                let signed: Transaction = serde_json::from_slice(&completed.serialized_transaction)
+                    .context("Failed to read signed transaction for wallet history")?;
+                normalize_local_send(&mut tx, kernel_fee(&signed)?);
+            }
+        }
+    }
+    Ok(tx.into())
 }
 
 /// Refresh mined Pending/Unconfirmed/Locked entries using this account's scanned tip.
@@ -265,9 +361,10 @@ pub fn refresh_transaction_confirmations(
     };
     let mut updated = Vec::new();
     for mut tx in get_displayed_transactions_needing_confirmation_update(&snapshot, account.id)? {
-        if refresh_mined_status(&mut tx, tip.height, required) {
+        let repaired_hash = restore_mined_block_hash(&snapshot, &mut tx)?;
+        if refresh_mined_status(&mut tx, tip.height, required) || repaired_hash {
             update_displayed_transaction_confirmations(&snapshot, &tx)?;
-            updated.push(tx.into());
+            updated.push(history_dto(&snapshot, tx)?);
         }
     }
     snapshot.commit()?;
@@ -285,7 +382,6 @@ fn refresh_mined_status(
         Status::Pending | Status::Unconfirmed | Status::Locked
     ) || tx.blockchain.block_height == 0
         || tx.blockchain.block_height > scanned_height
-        || tx.blockchain.block_hash == FixedHash::zero()
     {
         return false;
     }
@@ -362,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn unmined_unknown_or_removed_entries_are_not_promoted() {
+    fn unmined_future_or_removed_entries_are_not_promoted() {
         for status in [
             TransactionDisplayStatus::Cancelled,
             TransactionDisplayStatus::Rejected,
@@ -383,9 +479,23 @@ mod tests {
         assert_eq!(tx.status, TransactionDisplayStatus::Pending);
         tx.blockchain.block_height = 363715;
         assert!(!refresh_mined_status(&mut tx, 363714, 3));
-        tx.blockchain.block_height = 363574;
+    }
+
+    #[test]
+    fn mined_send_with_upstreams_zero_block_hash_reaches_confirmed() {
+        let mut tx = received_transaction();
+        tx.direction = TransactionDirection::Outgoing;
+        tx.status = TransactionDisplayStatus::Unconfirmed;
         tx.blockchain.block_hash = FixedHash::zero();
-        assert!(!refresh_mined_status(&mut tx, 363714, 3));
+        assert!(refresh_mined_status(&mut tx, 363576, 3));
+        assert_eq!(tx.blockchain.confirmations, 2);
+        assert_eq!(tx.status, TransactionDisplayStatus::Unconfirmed);
+        assert!(refresh_mined_status(&mut tx, 363577, 3));
+        assert_eq!(tx.blockchain.confirmations, 3);
+        assert_eq!(tx.status, TransactionDisplayStatus::Confirmed);
+        // A known height is enough to count depth, but a real hash is still
+        // necessary to construct a current payment reference.
+        assert!(DisplayedTransactionDto::from(tx).payrefs.is_empty());
     }
 
     fn received_transaction() -> minotari_wallet::DisplayedTransaction {
@@ -506,6 +616,19 @@ mod tests {
             DisplayedTransactionDto::from(tx).payrefs,
             vec![reference.to_string()]
         );
+    }
+
+    #[test]
+    fn mined_send_replaces_provisional_payref_with_recipient_reference() {
+        let mut tx = received_transaction();
+        tx.direction = TransactionDirection::Outgoing;
+        let sent_hash = FixedHash::from([8_u8; 32]);
+        tx.details.sent_output_hashes = vec![sent_hash];
+        let provisional = generate_payment_reference(&FixedHash::zero(), &sent_hash);
+        tx.details.sent_payrefs = vec![provisional];
+        let mined = generate_payment_reference(&tx.blockchain.block_hash, &sent_hash).to_string();
+        assert_ne!(mined, provisional.to_string());
+        assert_eq!(DisplayedTransactionDto::from(tx).payrefs, vec![mined]);
     }
 
     #[test]
