@@ -524,11 +524,17 @@ fn outgoing_history_repairs_mined_status_payref_and_signed_fee_without_changing_
     .unwrap();
 
     let read_send = || {
-        get_transactions(fixture::WALLET_NAME.into(), 100, 0)
+        use rust_lib_flutter_rust_wallet::api::transactions::get_changed_transactions;
+        let changes = get_changed_transactions(
+            fixture::WALLET_NAME.into(),
+            Some(vec![(u64::MAX - 1).to_string()]),
+        )
+        .unwrap();
+        assert_eq!(changes.len(), 1);
+        assert!(get_changed_transactions(fixture::WALLET_NAME.into(), None)
             .unwrap()
-            .into_iter()
-            .find(|tx| tx.id == (u64::MAX - 1).to_string())
-            .unwrap()
+            .is_empty());
+        changes.into_iter().next().unwrap()
     };
     let dto = read_send();
     assert_eq!(dto.amount, 10_000_000);
@@ -632,4 +638,49 @@ fn outgoing_history_repairs_mined_status_payref_and_signed_fee_without_changing_
     )
     .unwrap();
     assert_eq!(read_send().payrefs, vec![reference]);
+}
+
+#[test]
+fn changed_history_retries_bad_rows_and_does_not_read_unrelated_history() {
+    use rust_lib_flutter_rust_wallet::api::transactions::get_changed_transactions;
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let db = with_fixture_db();
+    let conn = rusqlite::Connection::open(db._dir.path().join("wallet.db")).unwrap();
+    assert!(get_changed_transactions(fixture::WALLET_NAME.into(), None)
+        .unwrap()
+        .is_empty());
+    let original: String = conn
+        .query_row(
+            "SELECT transaction_json FROM displayed_transactions WHERE id = ?1",
+            [fixture::TX_ID.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE displayed_transactions SET transaction_json = 'invalid-json'",
+        [],
+    )
+    .unwrap();
+    // An unchanged cycle must not deserialize even an unrelated malformed row.
+    assert!(get_changed_transactions(fixture::WALLET_NAME.into(), None)
+        .unwrap()
+        .is_empty());
+    assert!(get_changed_transactions(
+        fixture::WALLET_NAME.into(),
+        Some(vec![fixture::TX_ID.to_string()]),
+    )
+    .is_err());
+    conn.execute(
+        "UPDATE displayed_transactions SET transaction_json = ?1",
+        [&original],
+    )
+    .unwrap();
+    // Failed reads were not acknowledged; a retry needs no new hint/event.
+    let changes = get_changed_transactions(fixture::WALLET_NAME.into(), None).unwrap();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].id, fixture::TX_ID.to_string());
+    assert_eq!(changes[0].amount, fixture::TX_AMOUNT);
+    assert!(get_changed_transactions(fixture::WALLET_NAME.into(), None)
+        .unwrap()
+        .is_empty());
 }

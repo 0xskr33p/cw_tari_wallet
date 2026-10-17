@@ -178,13 +178,14 @@ the frozen contract. Never bypass it on a dependency PR.
   producer* (it compiles to the native libs linked by the Flutter app), not a
   reusable library — so the lockfile is the reproducible-build record, not noise to
   be ignored. A reusable library would `.gitignore` it; we must not.
-- `minotari` is pinned to the **v0.3.0 git tag** (resolved commit is recorded in
-  `Cargo.lock`); `tari_common` / `tari_common_types` / `tari_hashing` /
-  `tari_transaction_components` are pinned exactly to `=6.0.1-pre.2`;
+- `minotari` is pinned to the **main revision `1ab7c8c651b2937a8b05fba9d5a432cf633ae3f8`**
+  (the merged scan-driven confirmation fix, #149; still reports package 0.3.0); `tari_common` / `tari_common_types` / `tari_hashing` /
+  `tari_transaction_components` are pinned exactly to `=6.2.0-pre.1`;
   `flutter_rust_bridge` is pinned **exactly** `=2.11.1`.
-- Keep the transitive `tari_*` crates on the same `6.0.1-pre.2` release in
-  `Cargo.lock`. Resolving some of them to `6.1.0` mixes incompatible
-  `tari_crypto` types. Use the committed lockfile (`--locked`) for builds and
+- Keep the transitive `tari_*` crates on the same `6.2.0-pre.1` release in
+  `Cargo.lock`. The wrapper uses `tari_crypto` 0.24 and the same SQLite
+  stack as minotari (`r2d2_sqlite` 0.34 / `rusqlite` 0.39). Mixing these
+  with the former 6.0.1-pre.2 / crypto 0.23 stack creates incompatible types. Use the committed lockfile (`--locked`) for builds and
   tests, including native iOS/Android builds.
 
 ### FRB runtime ↔ codegen CLI lockstep
@@ -230,7 +231,7 @@ process is:
    (function, class/enum, field, variant) means the bump leaked a contract change —
    revert, or promote to a MAJOR only via a coordinated migration (see below).
 
-Pre-release `tari_*` (`6.0.1-pre.2`) can change shape between pre-releases — never
+Pre-release `tari_*` (`6.2.0-pre.1`) can change shape between pre-releases — never
 auto-merge a `tari_*` bump.
 
 ### Dependency-update automation (Renovate)

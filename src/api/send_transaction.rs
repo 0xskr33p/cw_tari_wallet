@@ -187,13 +187,24 @@ where
         .finalize_transaction_and_broadcast(signed_transaction, base_url)
         .await
     {
-        Ok(tx) => tx,
+        Ok(sent) => {
+            // Finalization has recorded the send even when the first broadcast
+            // was not accepted. Treat it as pending, never invite a duplicate send.
+            if !sent.accepted_by_node {
+                log::warn!("Recorded send is pending node acceptance; the scanner will retry it");
+            }
+            sent.displayed_transaction
+        }
         Err(e) => {
             release_send_reservation(&idempotency_key);
             return Err(WalletError::network(e.to_string()).into());
         }
     };
 
+    crate::api::transactions::record_transaction_changes(
+        result_tx.details.account_id,
+        [result_tx.id.to_string()],
+    );
     report(TransactionStage::Completed, "Transaction sent");
 
     normalize_local_send(&mut result_tx, actual_fee);

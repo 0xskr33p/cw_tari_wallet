@@ -91,7 +91,9 @@ impl Database {
 #[frb]
 pub fn initialize_database(path: String) -> Result<()> {
     log::info!("Initializing database at {}", path);
-    Database::init(PathBuf::from(path))
+    Database::init(PathBuf::from(path))?;
+    crate::api::transactions::reset_transaction_changes();
+    Ok(())
 }
 
 /// Tear down the current wallet database, closing its connection pool.
@@ -108,7 +110,9 @@ pub fn disconnect_database() -> Result<()> {
     // block-await it here (this is a synchronous bridge fn; blocking on the async scan
     // task could deadlock the FRB runtime) — cancellation is the cooperative signal.
     crate::api::scanner::cancel_active_scan()?;
-    Database::disconnect()
+    Database::disconnect()?;
+    crate::api::transactions::reset_transaction_changes();
+    Ok(())
 }
 
 pub(crate) fn get_db_connection() -> Result<PooledConnection<SqliteConnectionManager>> {

@@ -1,5 +1,6 @@
 use crate::api::{db::get_db_connection, error::WalletError, utils::format_micro_tari};
 use crate::domain::history::{kernel_fee, normalize_local_send};
+use crate::domain::history_changes::{HistoryChanges, ScanHistoryChanges};
 use anyhow::{Context, Result};
 use flutter_rust_bridge::frb;
 use minotari_wallet::{
@@ -11,10 +12,54 @@ use minotari_wallet::{
     get_accounts,
     utils::timestamp::format_timestamp,
 };
+use once_cell::sync::Lazy;
 use r2d2_sqlite::rusqlite::{Connection, OptionalExtension};
+use std::sync::Mutex;
 use tari_common_types::{payment_reference::generate_payment_reference, types::FixedHash};
 use tari_transaction_components::transaction_components::Transaction;
 use tari_utilities::ByteArray;
+
+static HISTORY_CHANGES: Lazy<Mutex<HistoryChanges>> =
+    Lazy::new(|| Mutex::new(HistoryChanges::default()));
+
+pub(crate) fn record_transaction_changes(account: i64, ids: impl IntoIterator<Item = String>) {
+    HISTORY_CHANGES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record(account, ids);
+}
+
+pub(crate) fn begin_scan_history_changes() -> ScanHistoryChanges {
+    HISTORY_CHANGES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .begin_scan()
+}
+
+pub(crate) fn record_scan_transaction_changes(
+    scan: &mut ScanHistoryChanges,
+    account: i64,
+    ids: impl IntoIterator<Item = String>,
+) {
+    HISTORY_CHANGES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .record_scan(scan, account, ids);
+}
+
+pub(crate) fn finish_scan_history_changes(scan: ScanHistoryChanges) {
+    HISTORY_CHANGES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .finish_scan(scan);
+}
+
+pub(crate) fn reset_transaction_changes() {
+    HISTORY_CHANGES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clear();
+}
 /// Fee charged on a transaction: `amount` in **microTari** plus a pre-formatted
 /// `amount_display` string for the UI.
 #[frb]
@@ -261,6 +306,49 @@ pub fn get_transactions(
         .collect()
 }
 
+/// Read and acknowledge transactions changed by this process's scan/send events.
+///
+/// Returns current canonical history DTOs, including reorg changes, for this wallet
+/// only. Empty cycles read no history rows. Failed reads retain pending IDs, and
+/// concurrent updates remain pending. Load the full paginated history on opening:
+/// this in-memory notification queue is not a persistent history or a cursor.
+/// `transaction_ids` optionally includes IDs received in scan events; foreign or
+/// missing IDs are ignored. It does not change the scan event contract.
+#[frb]
+pub fn get_changed_transactions(
+    wallet_name: String,
+    transaction_ids: Option<Vec<String>>,
+) -> Result<Vec<DisplayedTransactionDto>> {
+    let mut conn = get_db_connection()?;
+    let account = get_accounts(&mut conn, Some(&wallet_name))?
+        .into_iter()
+        .next()
+        .ok_or(WalletError::NoAccounts)?;
+    if let Some(ids) = transaction_ids {
+        record_transaction_changes(account.id, ids);
+    }
+    let read = HISTORY_CHANGES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pending(account.id);
+    let mut changed = Vec::with_capacity(read.len());
+    for (id, _) in &read {
+        let json: Option<String> = conn.query_row(
+            "SELECT transaction_json FROM displayed_transactions WHERE account_id = ?1 AND id = ?2",
+            (account.id, id), |row| row.get(0),
+        ).optional()?;
+        if let Some(json) = json {
+            let tx = serde_json::from_str(&json).context("Invalid changed transaction history")?;
+            changed.push(history_dto(&conn, tx)?);
+        }
+    }
+    HISTORY_CHANGES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .acknowledge(account.id, &read);
+    Ok(changed)
+}
+
 fn restore_mined_block_hash(
     conn: &Connection,
     tx: &mut minotari_wallet::DisplayedTransaction,
@@ -336,8 +424,9 @@ fn history_dto(
 
 /// Refresh mined Pending/Unconfirmed/Locked entries using this account's scanned tip.
 ///
-/// Workaround for minotari 0.3.0's skipped transaction monitor, matching Universe.
-/// Call between scan cycles. Unmined sends and removed transactions are preserved.
+/// Legacy compatibility API for minotari v0.3.0's skipped monitor. The pinned
+/// main revision fixes that monitor; Cake now consumes scan updates instead.
+/// Unmined sends and removed transactions are preserved.
 /// Returns changed entries; existing scan events and read APIs are unchanged.
 #[frb]
 pub fn refresh_transaction_confirmations(
