@@ -74,7 +74,20 @@ pub struct SendTransactionEvent {
 
 #[frb(ignore)]
 pub async fn send_transaction_with_handler<F>(
+    details: SendTransactionDetails,
+    status_callback: F,
+) -> Result<DisplayedTransactionDto>
+where
+    F: Fn(SendTransactionEvent) + Send + Sync + 'static,
+{
+    send_transaction_with_fee_handler(details, None, status_callback).await
+}
+
+/// Internal runner shared by the frozen send API and the explicit fee API.
+#[frb(ignore)]
+pub async fn send_transaction_with_fee_handler<F>(
     mut details: SendTransactionDetails,
+    fee_limits: Option<(u64, u64)>,
     status_callback: F,
 ) -> Result<DisplayedTransactionDto>
 where
@@ -94,6 +107,13 @@ where
             .take()
             .unwrap_or_else(|| DEFAULT_PASSPHRASE.to_string()),
     );
+
+    if let Some((rate, maximum)) = fee_limits {
+        minotari_wallet::transactions::fund_locker::validate_fee_per_gram(MicroMinotari(rate))?;
+        if maximum == 0 {
+            anyhow::bail!("Maximum transaction fee must be greater than zero");
+        }
+    }
 
     let report = |stage: TransactionStage, msg: &str| {
         status_callback(SendTransactionEvent {
@@ -119,6 +139,9 @@ where
         validated.network,
         validated.confirmations,
     )?;
+    if let Some((rate, _)) = fee_limits {
+        sender.fee_per_gram = MicroMinotari(rate);
+    }
 
     // Derive the signing key manager and prove it belongs to this account *before*
     // `start_new_transaction` reserves any UTXO. Since the bump, `sign_locked_transaction`
@@ -164,7 +187,7 @@ where
     ) {
         Ok(tx) => tx,
         Err(e) => {
-            release_send_reservation(&idempotency_key);
+            release_send_reservation(&idempotency_key, sender.account.id);
             return Err(map_signing_error(e).into());
         }
     };
@@ -172,10 +195,16 @@ where
     let actual_fee = match kernel_fee(&signed_transaction.signed_transaction.transaction) {
         Ok(fee) => fee,
         Err(error) => {
-            release_send_reservation(&idempotency_key);
+            release_send_reservation(&idempotency_key, sender.account.id);
             return Err(error);
         }
     };
+    if let Some((_, maximum)) = fee_limits {
+        if let Err(error) = validate_confirmed_fee(actual_fee, maximum) {
+            release_send_reservation(&idempotency_key, sender.account.id);
+            return Err(error);
+        }
+    }
     report(TransactionStage::Broadcasting, "Broadcasting to network...");
 
     let base_url = details
@@ -196,7 +225,7 @@ where
             sent.displayed_transaction
         }
         Err(e) => {
-            release_send_reservation(&idempotency_key);
+            release_send_reservation(&idempotency_key, sender.account.id);
             return Err(WalletError::network(e.to_string()).into());
         }
     };
@@ -225,11 +254,22 @@ where
 ///
 /// Best-effort by design: this runs on an error path that already has a cause worth
 /// reporting, so a failure here is logged rather than allowed to mask the original error.
-fn release_send_reservation(idempotency_key: &str) {
+fn release_send_reservation(idempotency_key: &str, account_id: i64) {
     let released = get_db_connection()
         .map_err(|e| e.to_string())
         .and_then(|conn| {
-            expire_and_unlock_pending_transaction(&conn, idempotency_key).map_err(|e| e.to_string())
+            // Locks refer to pending_transactions.id, not its idempotency key.
+            let pending = minotari_wallet::db::find_pending_transaction_record_by_idempotency_key(
+                &conn,
+                idempotency_key,
+                account_id,
+            )
+            .map_err(|e| e.to_string())?;
+            match pending {
+                Some(record) => expire_and_unlock_pending_transaction(&conn, &record.id)
+                    .map_err(|e| e.to_string()),
+                None => Ok(false),
+            }
         });
 
     match released {
@@ -283,6 +323,13 @@ pub(crate) const SEED_WORDS_ACCOUNT_MISMATCH: &str =
     "The supplied seed words do not match this wallet account. Check that the wallet name, \
      passphrase and seed words all belong to the same wallet.";
 
+fn validate_confirmed_fee(actual_fee: u64, maximum: u64) -> Result<()> {
+    if actual_fee > maximum {
+        anyhow::bail!("Transaction fee exceeds the confirmed estimate. Review the payment again.");
+    }
+    Ok(())
+}
+
 /// Convert an upstream signing failure into a [`WalletError::Signing`].
 ///
 /// The payload-integrity failure is re-worded to [`SEED_WORDS_ACCOUNT_MISMATCH`] for the
@@ -322,6 +369,31 @@ pub async fn send_transaction(
         let _ = stream_sink.add(event);
     })
     .await
+}
+
+/// Send at an explicitly confirmed rate, refusing a fee above `max_fee` before
+/// broadcasting and releasing the reservation on refusal. Rate is microTari per
+/// gram; max_fee is microTari. Existing send API and DTO remain unchanged.
+#[frb]
+pub async fn send_transaction_with_fee(
+    sink: StreamSink<SendTransactionEvent>,
+    details: SendTransactionDetails,
+    fee_per_gram: u64,
+    max_fee: u64,
+) -> Result<()> {
+    let events = sink.clone();
+    let result =
+        send_transaction_with_fee_handler(details, Some((fee_per_gram, max_fee)), move |event| {
+            let _ = events.add(event);
+        })
+        .await;
+    if let Err(error) = result {
+        // FRB runs this function on a separate unawaited normal-task channel.
+        // Return errors on the stream Cake listens to before dropping its sink;
+        // do not leave an unhandled error on the normal-task Future instead.
+        let _ = sink.add_error(error);
+    }
+    Ok(())
 }
 
 /// Thin adapter: resolve the network (frozen `None → MainNet` default) and hand the
@@ -380,9 +452,21 @@ fn build_unsigned_transaction(
 
     let idempotency_key = uuid::Uuid::new_v4().to_string();
 
-    let tx = sender
-        .start_new_transaction(idempotency_key.clone(), recipient, SECONDS_TO_LOCK_UTXO)
-        .map_err(|e| WalletError::wallet(format!("Failed to build transaction: {}", e)))?;
+    let tx = match sender.start_new_transaction(
+        idempotency_key.clone(),
+        recipient,
+        SECONDS_TO_LOCK_UTXO,
+    ) {
+        Ok(tx) => tx,
+        Err(error) => {
+            // Upstream can reserve inputs and then fail while preparing the
+            // payload. The caller never receives the key on this error path.
+            release_send_reservation(&idempotency_key, sender.account.id);
+            return Err(
+                WalletError::wallet(format!("Failed to build transaction: {}", error)).into(),
+            );
+        }
+    };
 
     Ok((idempotency_key, tx))
 }
@@ -402,6 +486,15 @@ mod tests {
     use tari_common_types::types::CompressedPublicKey;
     use tari_crypto::ristretto::RistrettoSecretKey;
     use tari_utilities::ByteArray;
+
+    #[test]
+    fn confirmed_fee_is_an_upper_bound_including_uint64_edges() {
+        assert!(validate_confirmed_fee(1, 1).is_ok());
+        assert!(validate_confirmed_fee(1, u64::MAX).is_ok());
+        assert!(validate_confirmed_fee(u64::MAX, u64::MAX).is_ok());
+        assert!(validate_confirmed_fee(2, 1).is_err());
+        assert!(validate_confirmed_fee(u64::MAX, 1).is_err());
+    }
 
     /// Build a deterministic, valid base58 Tari (dual) address from fixed key
     /// bytes. The bytes are small little-endian scalars (well below the group
