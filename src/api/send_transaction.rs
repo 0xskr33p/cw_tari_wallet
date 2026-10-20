@@ -205,12 +205,10 @@ where
 
 /// Release the UTXOs this send reserved, best-effort.
 ///
-/// `start_new_transaction` flips the selected outputs to `Locked` and commits. Upstream
-/// releases them again from `TransactionUnlocker::unlock_expired_transactions`, but that
-/// only ever runs from `minotari`'s **daemon**, which Cake Wallet does not link — it
-/// links this library. `fetch_unspent_outputs` has no expiry clause either, so nothing
-/// re-examines a stale lock: without this call `SECONDS_TO_LOCK_UTXO` is decorative and
-/// the lock is effectively permanent.
+/// `start_new_transaction` flips the selected outputs to `Locked` and commits. The only
+/// other release in this embedding is the expiry sweep `initialize_database` runs
+/// (`release_expired_reservations`), which waits out `SECONDS_TO_LOCK_UTXO`; this call
+/// hands them back straight away.
 ///
 /// `pending_transaction_id` is the `pending_transactions` row id (not the idempotency
 /// key). `expire_and_unlock_pending_transaction` only acts while that row is still
@@ -232,7 +230,7 @@ fn release_send_reservation(pending_transaction_id: &str) {
         Ok(false) => log::debug!("No pending UTXO reservation to release for a failed send"),
         Err(e) => log::warn!(
             "Failed to release the UTXO reservation for a failed send; these outputs stay \
-             locked until the account is rescanned: {e}"
+             locked until the reservation expires and the database is next initialized: {e}"
         ),
     }
 }
@@ -633,14 +631,18 @@ mod tests {
         );
     }
 
-    /// Exception to the DB-free unit-test rule: a reservation released by the wrong id
-    /// leaves the user's UTXOs locked with no error, so this pins the id seam against a
-    /// real temp DB (no globals). The output is seeded the way upstream's own tests do.
-    #[test]
-    fn reservation_is_released_by_pending_row_id_not_idempotency_key() {
+    /// A temp wallet DB (no globals) holding one spendable output that
+    /// `build_unsigned_transaction` has reserved. Seeded the way upstream's own tests do.
+    /// Returns the temp dir (keep it alive), the pool, the output id and the pending row id.
+    fn reserve_one_output() -> (
+        tempfile::TempDir,
+        minotari_wallet::db::SqlitePool,
+        i64,
+        String,
+    ) {
         use minotari_wallet::db::{
-            create_account, get_account_by_name, get_output_lock_request_id, init_db,
-            insert_output, insert_scanned_tip_block, mark_output_confirmed,
+            create_account, get_account_by_name, init_db, insert_output, insert_scanned_tip_block,
+            mark_output_confirmed,
         };
         use tari_common_types::seeds::cipher_seed::CipherSeed;
         use tari_common_types::types::{FixedHash, PrivateKey};
@@ -657,7 +659,7 @@ mod tests {
         let account = get_account_by_name(&conn, "test").unwrap().unwrap();
         insert_scanned_tip_block(&conn, account.id, 200, &[0u8; 32]).unwrap();
 
-        // One spendable output, mined at 100 under a tip of 200.
+        // One spendable output, mined and confirmed at 100 under a tip of 200.
         let output = WalletOutput::new_from_parts(
             Default::default(),
             MicroMinotari(1_000_000),
@@ -703,19 +705,33 @@ mod tests {
             3,
         )
         .unwrap();
-
         let (pending_id, _) =
             build_unsigned_transaction(&mut sender, address, MicroMinotari(1_000), None).unwrap();
 
-        let status = |conn: &r2d2_sqlite::rusqlite::Connection| -> String {
-            conn.query_row(
-                "SELECT status FROM outputs WHERE id = ?1",
-                [output_id],
-                |row| row.get(0),
-            )
-            .unwrap()
-        };
-        assert_eq!(status(&conn), "LOCKED");
+        drop(conn);
+        (dir, pool, output_id, pending_id)
+    }
+
+    fn output_status(conn: &r2d2_sqlite::rusqlite::Connection, output_id: i64) -> String {
+        conn.query_row(
+            "SELECT status FROM outputs WHERE id = ?1",
+            [output_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Exception to the DB-free unit-test rule: a reservation released by the wrong id
+    /// leaves the user's UTXOs locked with no error, so this pins the id seam against a
+    /// real temp DB.
+    #[test]
+    fn reservation_is_released_by_pending_row_id_not_idempotency_key() {
+        use minotari_wallet::db::get_output_lock_request_id;
+
+        let (_dir, pool, output_id, pending_id) = reserve_one_output();
+        let conn = pool.get().unwrap();
+
+        assert_eq!(output_status(&conn, output_id), "LOCKED");
         assert_eq!(
             get_output_lock_request_id(&conn, output_id).unwrap(),
             Some(pending_id.clone()),
@@ -732,12 +748,33 @@ mod tests {
             .unwrap();
         assert_ne!(idempotency_key, pending_id);
         assert!(!expire_and_unlock_pending_transaction(&conn, &idempotency_key).unwrap());
-        assert_eq!(status(&conn), "LOCKED");
+        assert_eq!(output_status(&conn, output_id), "LOCKED");
 
         // The pending row id releases the output.
         assert!(expire_and_unlock_pending_transaction(&conn, &pending_id).unwrap());
-        assert_eq!(status(&conn), "UNSPENT");
+        assert_eq!(output_status(&conn, output_id), "UNSPENT");
         assert_eq!(get_output_lock_request_id(&conn, output_id).unwrap(), None);
+    }
+
+    /// Exception to the DB-free unit-test rule (see above): the sweep
+    /// `initialize_database` runs releases a stale reservation but not a live one.
+    #[test]
+    fn expired_reservations_are_released_on_database_init() {
+        let (_dir, pool, output_id, pending_id) = reserve_one_output();
+        let conn = pool.get().unwrap();
+
+        // Not expired yet: the sweep leaves it alone.
+        crate::api::db::release_expired_reservations(&conn);
+        assert_eq!(output_status(&conn, output_id), "LOCKED");
+
+        // A reservation stranded long ago, e.g. by an app kill before recording.
+        conn.execute(
+            "UPDATE pending_transactions SET expires_at = '2000-01-01 00:00:00' WHERE id = ?1",
+            [&pending_id],
+        )
+        .unwrap();
+        crate::api::db::release_expired_reservations(&conn);
+        assert_eq!(output_status(&conn, output_id), "UNSPENT");
     }
 
     #[test]

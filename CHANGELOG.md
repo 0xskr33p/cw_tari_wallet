@@ -148,7 +148,7 @@ diff) before the version is tagged.
   practice **permanent**. Combined with the new signing precondition below and a
   fresh random idempotency key per attempt, a user who mistyped one seed word and
   retried could permanently lock a different UTXO set each time, recoverable only
-  by deleting the DB and rescanning. Two changes close this:
+  by deleting the DB and rescanning. Three changes close this:
   1. `send_transaction` now verifies the supplied seed words control the account
      **before** reserving anything, so the common mismatch costs nothing.
   2. A signing or finalize failure after the reservation now releases it via
@@ -158,6 +158,12 @@ diff) before the version is tagged.
      recorded transaction. Upstream releases on most of its finalize failure paths;
      the bridge releases again as a backstop, which does nothing once the send is
      recorded.
+  3. `initialize_database` now runs upstream's expiry sweep
+     (`TransactionUnlocker::unlock_expired_transactions`) once, best-effort. It
+     releases reservations still `Pending` past `expires_at`, healing inputs
+     stranded by an app kill between reserving and recording, or by the earlier
+     release-by-idempotency-key bug. A recorded send is never touched, and a sweep
+     failure is logged without failing `initialize_database`.
 
 ### Security
 

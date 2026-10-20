@@ -144,15 +144,16 @@ These values are byte-for-byte what they were before consolidation and are pinne
 by value-guard tests.
 
 `SECONDS_TO_LOCK_UTXO` is **not** a duration after which the lock lifts by itself.
-It is handed to upstream's `start_new_transaction` as the reservation's `expires_at`,
-but nothing in this embedding ever processes that expiry: upstream releases expired
-reservations from `TransactionUnlocker::unlock_expired_transactions`, which only runs
-in `minotari`'s daemon (Cake Wallet links this library, not the daemon), and
-`fetch_unspent_outputs` selects on `status` with no expiry clause. Reserved UTXOs are
-therefore released only by an explicit call — `finalize_transaction_and_broadcast` on
-most of its own failure paths, or `release_send_reservation` (by pending-row id) when
-signing or finalize fails (a backstop that does nothing once the send is recorded). A process kill
-between reserving and broadcasting still strands them until the account is rescanned. `DEFAULT_BASE_URL` is **not** derived from the requested
+It is handed to upstream's `start_new_transaction` as the reservation's `expires_at`.
+Upstream's daemon sweeps expired reservations every minute, but Cake Wallet links this
+library, not the daemon, and `fetch_unspent_outputs` selects on `status` with no expiry
+clause. Reserved UTXOs are released by `finalize_transaction_and_broadcast` on most of
+its own failure paths, by `release_send_reservation` (by pending-row id) when signing
+or finalize fails (a backstop that does nothing once the send is recorded), and by one
+`TransactionUnlocker::unlock_expired_transactions` sweep in `initialize_database`
+(best-effort; it only releases `Pending` rows past `expires_at`). So a process kill
+between reserving and recording strands them until the reservation expires and the
+database is next initialized. `DEFAULT_BASE_URL` is **not** derived from the requested
 network (deriving it would change observable behavior — a deferred, coordinated
 change).
 
