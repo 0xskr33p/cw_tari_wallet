@@ -150,8 +150,8 @@ reservations from `TransactionUnlocker::unlock_expired_transactions`, which only
 in `minotari`'s daemon (Cake Wallet links this library, not the daemon), and
 `fetch_unspent_outputs` selects on `status` with no expiry clause. Reserved UTXOs are
 therefore released only by an explicit call — `finalize_transaction_and_broadcast` on
-its own failure paths, or `release_send_reservation` (by pending-row id) when the
-bridge's signing step fails. A process kill
+most of its own failure paths, or `release_send_reservation` (by pending-row id) when
+signing or finalize fails (a backstop that does nothing once the send is recorded). A process kill
 between reserving and broadcasting still strands them until the account is rescanned. `DEFAULT_BASE_URL` is **not** derived from the requested
 network (deriving it would change observable behavior — a deferred, coordinated
 change).

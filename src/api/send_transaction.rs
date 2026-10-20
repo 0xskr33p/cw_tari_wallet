@@ -135,8 +135,9 @@ where
         TransactionStage::ConstructingTransaction,
         "Building transaction UTXOs...",
     );
-    // From here on UTXOs are reserved. Upstream releases them on its own failure
-    // paths; signing is ours, so a signing failure must release them here.
+    // From here on UTXOs are reserved. Upstream releases them on most of its failure
+    // paths; the bridge releases on a signing failure and again as a backstop on a
+    // finalize failure, which does nothing once the send is recorded.
     let (pending_transaction_id, unsigned_tx) = build_unsigned_transaction(
         &mut sender,
         validated.recipient_address,
@@ -181,7 +182,10 @@ where
         .await
     {
         Ok(tx) => tx,
-        Err(e) => return Err(WalletError::network(e.to_string()).into()),
+        Err(e) => {
+            release_send_reservation(&pending_transaction_id);
+            return Err(WalletError::network(e.to_string()).into());
+        }
     };
 
     // The send is recorded either way; a send the node has not accepted is
@@ -358,7 +362,7 @@ fn create_transaction_sender(
 /// Reserve inputs and build the unsigned transaction.
 ///
 /// Returns the id of the pending row that now holds the `Locked` UTXOs alongside the
-/// payload; the caller needs it to release them if signing fails (see
+/// payload; the caller needs it to release them if a later step fails (see
 /// [`release_send_reservation`]).
 fn build_unsigned_transaction(
     sender: &mut TransactionSender,
