@@ -396,12 +396,6 @@ where
 {
     let db_path = get_db_path()?;
 
-    // Best-effort: free inputs a stale reservation still holds before the scan runs.
-    match get_db_connection() {
-        Ok(conn) => release_expired_reservations(&conn),
-        Err(e) => log::warn!("Could not check for expired UTXO reservations: {e}"),
-    }
-
     let cancel_token = CancellationToken::new();
     let scan_id = SCAN_ID.fetch_add(1, Ordering::Relaxed);
 
@@ -453,6 +447,13 @@ where
         // Best-effort: let the old forwarder drain and exit; abort as a backstop.
         previous.forwarder.abort();
         let _ = previous.forwarder.await;
+    }
+
+    // Best-effort: free inputs a stale reservation still holds before the scan runs.
+    // After the previous scan has stopped, so its writes cannot hold up the sweep.
+    match get_db_connection() {
+        Ok(conn) => release_expired_reservations(&conn),
+        Err(e) => log::warn!("Could not check for expired UTXO reservations: {e}"),
     }
 
     let result = scan_future.await;
