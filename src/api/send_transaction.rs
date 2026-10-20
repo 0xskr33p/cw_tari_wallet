@@ -186,9 +186,19 @@ where
         }
     };
 
+    // The send is recorded either way; a send the node has not accepted is
+    // rebroadcast by the scan's transaction monitor and must not be retried.
+    if !result_tx.accepted_by_node {
+        log::warn!(
+            "Send recorded but not yet accepted by the node: note={:?}, node_reason={:?}",
+            result_tx.note,
+            result_tx.node_reason
+        );
+    }
+
     report(TransactionStage::Completed, "Transaction sent");
 
-    Ok(result_tx.into())
+    Ok(result_tx.displayed_transaction.into())
 }
 
 /// Release the UTXOs this send reserved, best-effort.
