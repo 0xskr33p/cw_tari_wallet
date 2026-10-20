@@ -450,7 +450,8 @@ where
     }
 
     // Best-effort: free inputs a stale reservation still holds before the scan runs.
-    // After the previous scan has stopped, so its writes cannot hold up the sweep.
+    // After the previous scan has been cancelled; a write batch it is still finishing
+    // can briefly hold the write lock (bounded by busy_timeout).
     match get_db_connection() {
         Ok(conn) => release_expired_reservations(&conn),
         Err(e) => log::warn!("Could not check for expired UTXO reservations: {e}"),
