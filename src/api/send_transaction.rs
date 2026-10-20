@@ -628,6 +628,113 @@ mod tests {
         );
     }
 
+    /// Exception to the DB-free unit-test rule: a reservation released by the wrong id
+    /// leaves the user's UTXOs locked with no error, so this pins the id seam against a
+    /// real temp DB (no globals). The output is seeded the way upstream's own tests do.
+    #[test]
+    fn reservation_is_released_by_pending_row_id_not_idempotency_key() {
+        use minotari_wallet::db::{
+            create_account, get_account_by_name, get_output_lock_request_id, init_db,
+            insert_output, insert_scanned_tip_block, mark_output_confirmed,
+        };
+        use tari_common_types::seeds::cipher_seed::CipherSeed;
+        use tari_common_types::types::{FixedHash, PrivateKey};
+        use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
+        use tari_transaction_components::transaction_components::{MemoField, WalletOutput};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pool = init_db(dir.path().join("wallet.db")).unwrap();
+        let conn = pool.get().unwrap();
+
+        let wallet =
+            WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
+        create_account(&conn, "test", &wallet, "pass").unwrap();
+        let account = get_account_by_name(&conn, "test").unwrap().unwrap();
+        insert_scanned_tip_block(&conn, account.id, 200, &[0u8; 32]).unwrap();
+
+        // One spendable output, mined at 100 under a tip of 200.
+        let output = WalletOutput::new_from_parts(
+            Default::default(),
+            MicroMinotari(1_000_000),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            0,
+            Default::default(),
+            Default::default(),
+            MicroMinotari(0),
+            None,
+            MemoField::new_empty(),
+            FixedHash::from([1u8; 32]),
+            Default::default(),
+        );
+        let output_id = insert_output(
+            &conn,
+            account.id,
+            &PrivateKey::default(),
+            vec![1u8; 32],
+            &output,
+            100,
+            &FixedHash::zero(),
+            1_700_000_000,
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .unwrap();
+        mark_output_confirmed(&conn, &FixedHash::from([1u8; 32]), 100, &[0u8; 32]).unwrap();
+
+        let address = account.get_address(Network::LocalNet, "pass").unwrap();
+        let mut sender = TransactionSender::new(
+            pool.clone(),
+            "test".to_string(),
+            Zeroizing::new("pass".to_string()),
+            Network::LocalNet,
+            3,
+        )
+        .unwrap();
+
+        let (pending_id, _) =
+            build_unsigned_transaction(&mut sender, address, MicroMinotari(1_000), None).unwrap();
+
+        let status = |conn: &r2d2_sqlite::rusqlite::Connection| -> String {
+            conn.query_row(
+                "SELECT status FROM outputs WHERE id = ?1",
+                [output_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(status(&conn), "LOCKED");
+        assert_eq!(
+            get_output_lock_request_id(&conn, output_id).unwrap(),
+            Some(pending_id.clone()),
+            "the returned id must be the pending row that holds the lock"
+        );
+
+        // The idempotency key is a different value and releases nothing.
+        let idempotency_key: String = conn
+            .query_row(
+                "SELECT idempotency_key FROM pending_transactions WHERE id = ?1",
+                [&pending_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(idempotency_key, pending_id);
+        assert!(!expire_and_unlock_pending_transaction(&conn, &idempotency_key).unwrap());
+        assert_eq!(status(&conn), "LOCKED");
+
+        // The pending row id releases the output.
+        assert!(expire_and_unlock_pending_transaction(&conn, &pending_id).unwrap());
+        assert_eq!(status(&conn), "UNSPENT");
+        assert_eq!(get_output_lock_request_id(&conn, output_id).unwrap(), None);
+    }
+
     #[test]
     fn adapter_resolves_network_and_passes_through_valid_inputs() {
         let details = details_with(
