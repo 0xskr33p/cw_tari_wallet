@@ -110,10 +110,12 @@ diff) before the version is tagged.
   by deleting the DB and rescanning. Two changes close this:
   1. `send_transaction` now verifies the supplied seed words control the account
      **before** reserving anything, so the common mismatch costs nothing.
-  2. Any failure after the reservation (signing or broadcast) now releases it via
-     `db::expire_and_unlock_pending_transaction`, which only acts while the row is
-     still `Pending` and so can never hand back the inputs of a transaction that
-     already reached the network.
+  2. A signing failure after the reservation now releases it via
+     `db::expire_and_unlock_pending_transaction`, keyed by the pending row's id (not
+     the idempotency key, which matched no row and released nothing). It only acts
+     while the row is still `Pending`, so it can never hand back the inputs of a
+     recorded transaction. Upstream releases the reservation itself on its own
+     finalize/broadcast failure paths.
 
 ### Security
 

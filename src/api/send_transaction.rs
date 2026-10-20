@@ -123,8 +123,8 @@ where
     // `start_new_transaction` reserves any UTXO. Since the bump, `sign_locked_transaction`
     // verifies a payload-integrity signature made with the preparing wallet's view key,
     // so a seed/account mismatch fails at signing — by which point the inputs are already
-    // `Locked`, and nothing in this embedding ever unlocks them (see
-    // `release_send_reservation`). Checking first makes that mismatch cost nothing.
+    // `Locked` and must be released again (see `release_send_reservation`). Checking first
+    // makes that mismatch cost nothing.
     //
     // No stage event is emitted here: the streamed `TransactionStage` sequence is frozen
     // contract, so `SigningKeyGeneration` stays at its original position below.
@@ -135,8 +135,9 @@ where
         TransactionStage::ConstructingTransaction,
         "Building transaction UTXOs...",
     );
-    // From here on UTXOs are reserved, so every failure path must release them.
-    let (idempotency_key, unsigned_tx) = build_unsigned_transaction(
+    // From here on UTXOs are reserved. Upstream releases them on its own failure
+    // paths; signing is ours, so a signing failure must release them here.
+    let (pending_transaction_id, unsigned_tx) = build_unsigned_transaction(
         &mut sender,
         validated.recipient_address,
         validated.amount,
@@ -163,7 +164,7 @@ where
     ) {
         Ok(tx) => tx,
         Err(e) => {
-            release_send_reservation(&idempotency_key);
+            release_send_reservation(&pending_transaction_id);
             return Err(map_signing_error(e).into());
         }
     };
@@ -180,10 +181,7 @@ where
         .await
     {
         Ok(tx) => tx,
-        Err(e) => {
-            release_send_reservation(&idempotency_key);
-            return Err(WalletError::network(e.to_string()).into());
-        }
+        Err(e) => return Err(WalletError::network(e.to_string()).into()),
     };
 
     // The send is recorded either way; a send the node has not accepted is
@@ -210,16 +208,18 @@ where
 /// re-examines a stale lock: without this call `SECONDS_TO_LOCK_UTXO` is decorative and
 /// the lock is effectively permanent.
 ///
-/// `expire_and_unlock_pending_transaction` only acts while the row is still `Pending`, so
-/// it cannot hand back the inputs of a transaction that already reached the network.
+/// `pending_transaction_id` is the `pending_transactions` row id (not the idempotency
+/// key). `expire_and_unlock_pending_transaction` only acts while that row is still
+/// `Pending`, so it cannot hand back the inputs of a transaction that was recorded.
 ///
 /// Best-effort by design: this runs on an error path that already has a cause worth
 /// reporting, so a failure here is logged rather than allowed to mask the original error.
-fn release_send_reservation(idempotency_key: &str) {
+fn release_send_reservation(pending_transaction_id: &str) {
     let released = get_db_connection()
         .map_err(|e| e.to_string())
         .and_then(|conn| {
-            expire_and_unlock_pending_transaction(&conn, idempotency_key).map_err(|e| e.to_string())
+            expire_and_unlock_pending_transaction(&conn, pending_transaction_id)
+                .map_err(|e| e.to_string())
         });
 
     match released {
@@ -353,9 +353,9 @@ fn create_transaction_sender(
 
 /// Reserve inputs and build the unsigned transaction.
 ///
-/// Returns the idempotency key alongside the payload: it identifies the pending row that
-/// now holds the `Locked` UTXOs, and the caller needs it to release them if any later
-/// step fails (see [`release_send_reservation`]).
+/// Returns the id of the pending row that now holds the `Locked` UTXOs alongside the
+/// payload; the caller needs it to release them if signing fails (see
+/// [`release_send_reservation`]).
 fn build_unsigned_transaction(
     sender: &mut TransactionSender,
     address: TariAddress,
@@ -371,10 +371,10 @@ fn build_unsigned_transaction(
     let idempotency_key = uuid::Uuid::new_v4().to_string();
 
     let tx = sender
-        .start_new_transaction(idempotency_key.clone(), recipient, SECONDS_TO_LOCK_UTXO)
+        .start_new_transaction(idempotency_key, recipient, SECONDS_TO_LOCK_UTXO)
         .map_err(|e| WalletError::wallet(format!("Failed to build transaction: {}", e)))?;
 
-    Ok((idempotency_key, tx))
+    Ok((sender.processed_transactions.id().to_string(), tx))
 }
 
 #[cfg(test)]
