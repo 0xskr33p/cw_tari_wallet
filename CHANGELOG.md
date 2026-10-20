@@ -54,10 +54,14 @@ diff) before the version is tagged.
   1. **A send the node does not accept no longer fails.** Upstream records the
      send before broadcasting; if the node refuses it or cannot be reached,
      `send_transaction` still emits `Completed` and resolves `Ok` with a `Pending`
-     `DisplayedTransactionDto`, and the scan's transaction monitor rebroadcasts it.
-     **Do not resend after `Ok`.** `Network Error: …` now only comes from failures
-     before the send is recorded. The node's answer is logged; exposing it to Dart
-     is planned as a new additive API.
+     `DisplayedTransactionDto`. Cake must present `Ok` as "submitted, pending"
+     (not "sent") and block re-sends while an earlier send is `Pending`. The inputs
+     of a send the node has not accepted stay locked until it confirms; the
+     transaction monitor rebroadcasts it only while `start_scan` runs, using the
+     scan's `base_url`, so switching to an honest node lets it go through.
+     `Network Error: …` now only comes from failures before the send is recorded.
+     The node's answer is logged; exposing it to Dart is planned as a new additive
+     API.
   2. **Every send needs a change output.** Sending the whole balance fails with
      `Wallet Error: Failed to build transaction: Not enough funds for a change
      output: needs <shortfall> more to create a change output`.

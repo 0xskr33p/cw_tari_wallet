@@ -21,6 +21,7 @@ import 'transactions.dart';
 ///
 /// `Ok` means the send is recorded, not necessarily accepted by the node; the
 /// scan's transaction monitor rebroadcasts it, so **do not resend after `Ok`**.
+/// Rebroadcast only happens while `start_scan` runs.
 /// `Network Error` only comes from failures before the send is recorded.
 ///
 /// Async and streamed. The send **continues even if the Dart stream is closed**
