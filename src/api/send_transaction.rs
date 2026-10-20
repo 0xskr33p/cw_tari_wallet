@@ -1,5 +1,5 @@
 use crate::api::config::{DEFAULT_BASE_URL, DEFAULT_PASSPHRASE, SECONDS_TO_LOCK_UTXO};
-use crate::api::db::{get_db_connection, get_db_pool};
+use crate::api::db::{get_db_connection, get_db_pool, release_expired_reservations};
 use crate::api::error::WalletError;
 use crate::api::network::{apply_network, parse_network, TariNetwork};
 use crate::api::transactions::DisplayedTransactionDto;
@@ -131,6 +131,12 @@ where
     let key_manager = key_manager_from_seed_words(&seed_words)?;
     verify_seed_words_match_account(&details.wallet_name, &passphrase, &key_manager)?;
 
+    // Best-effort: free inputs a stale reservation still holds before selecting new ones.
+    match get_db_connection() {
+        Ok(conn) => release_expired_reservations(&conn),
+        Err(e) => log::warn!("Could not check for expired UTXO reservations: {e}"),
+    }
+
     report(
         TransactionStage::ConstructingTransaction,
         "Building transaction UTXOs...",
@@ -206,9 +212,9 @@ where
 /// Release the UTXOs this send reserved, best-effort.
 ///
 /// `start_new_transaction` flips the selected outputs to `Locked` and commits. The only
-/// other release in this embedding is the expiry sweep `initialize_database` runs
-/// (`release_expired_reservations`), which waits out `SECONDS_TO_LOCK_UTXO`; this call
-/// hands them back straight away.
+/// other release in this embedding is the expiry sweep (`release_expired_reservations`,
+/// run at database init and at the start of each send and scan), which waits out
+/// `SECONDS_TO_LOCK_UTXO`; this call hands them back straight away.
 ///
 /// `pending_transaction_id` is the `pending_transactions` row id (not the idempotency
 /// key). `expire_and_unlock_pending_transaction` only acts while that row is still
@@ -230,7 +236,7 @@ fn release_send_reservation(pending_transaction_id: &str) {
         Ok(false) => log::debug!("No pending UTXO reservation to release for a failed send"),
         Err(e) => log::warn!(
             "Failed to release the UTXO reservation for a failed send; these outputs stay \
-             locked until the reservation expires and the database is next initialized: {e}"
+             locked until the reservation expires and the next send, scan or init sweeps it: {e}"
         ),
     }
 }
@@ -756,8 +762,8 @@ mod tests {
         assert_eq!(get_output_lock_request_id(&conn, output_id).unwrap(), None);
     }
 
-    /// Exception to the DB-free unit-test rule (see above): the sweep
-    /// `initialize_database` runs releases a stale reservation but not a live one.
+    /// Exception to the DB-free unit-test rule (see above): the sweep run at database
+    /// init and at send/scan start releases a stale reservation but not a live one.
     #[test]
     fn expired_reservations_are_released_on_database_init() {
         let (_dir, pool, output_id, pending_id) = reserve_one_output();

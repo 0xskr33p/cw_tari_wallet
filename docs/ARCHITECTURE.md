@@ -149,11 +149,12 @@ Upstream's daemon sweeps expired reservations every minute, but Cake Wallet link
 library, not the daemon, and `fetch_unspent_outputs` selects on `status` with no expiry
 clause. Reserved UTXOs are released by `finalize_transaction_and_broadcast` on most of
 its own failure paths, by `release_send_reservation` (by pending-row id) when signing
-or finalize fails (a backstop that does nothing once the send is recorded), and by one
-`TransactionUnlocker::unlock_expired_transactions` sweep in `initialize_database`
-(best-effort; it only releases `Pending` rows past `expires_at`). So a process kill
-between reserving and recording strands them until the reservation expires and the
-database is next initialized. `DEFAULT_BASE_URL` is **not** derived from the requested
+or finalize fails (a backstop that does nothing once the send is recorded), and by a
+`TransactionUnlocker::unlock_expired_transactions` sweep at `initialize_database`, at
+the start of each send and at the start of each scan (best-effort; it only releases
+`Pending` rows past `expires_at`). So a reservation the bridge fails to release (e.g. a
+process kill between reserving and recording) stays locked until it expires and the
+next init, send or scan runs. `DEFAULT_BASE_URL` is **not** derived from the requested
 network (deriving it would change observable behavior — a deferred, coordinated
 change).
 

@@ -94,7 +94,7 @@ test.
   seam today. Deliberate exceptions:
   `reservation_is_released_by_pending_row_id_not_idempotency_key` and
   `expired_reservations_are_released_on_database_init` drive
-  `build_unsigned_transaction` and the init-time expiry sweep against a temp DB (no
+  `build_unsigned_transaction` and the expiry sweep against a temp DB (no
   globals), because a reservation released wrongly leaves UTXOs locked with no
   error.
 - **The FRB bridge surface** (`src/frb_generated.rs`, `.dart/**`) — generated code;

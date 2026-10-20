@@ -1,6 +1,9 @@
 use crate::api::error::WalletError;
 use crate::api::transactions::DisplayedTransactionDto;
-use crate::{api::db::get_db_path, frb_generated::StreamSink};
+use crate::{
+    api::db::{get_db_connection, get_db_path, release_expired_reservations},
+    frb_generated::StreamSink,
+};
 use anyhow::{anyhow, Result};
 use flutter_rust_bridge::frb;
 use minotari_wallet::scan::{DisplayedTransactionsEvent, TransactionsUpdatedEvent};
@@ -392,6 +395,12 @@ where
     F: Fn(ScanEventDto) -> Result<()> + Send + Sync + 'static,
 {
     let db_path = get_db_path()?;
+
+    // Best-effort: free inputs a stale reservation still holds before the scan runs.
+    match get_db_connection() {
+        Ok(conn) => release_expired_reservations(&conn),
+        Err(e) => log::warn!("Could not check for expired UTXO reservations: {e}"),
+    }
 
     let cancel_token = CancellationToken::new();
     let scan_id = SCAN_ID.fetch_add(1, Ordering::Relaxed);

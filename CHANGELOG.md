@@ -173,12 +173,13 @@ diff) before the version is tagged.
      recorded transaction. Upstream releases on most of its finalize failure paths;
      the bridge releases again as a backstop, which does nothing once the send is
      recorded.
-  3. `initialize_database` now runs upstream's expiry sweep
-     (`TransactionUnlocker::unlock_expired_transactions`) once, best-effort. It
+  3. `initialize_database`, and the start of each `send_transaction` and
+     `start_scan`, now run upstream's expiry sweep
+     (`TransactionUnlocker::unlock_expired_transactions`), best-effort. It
      releases reservations still `Pending` past `expires_at`, healing inputs
      stranded by an app kill between reserving and recording, or by the earlier
      release-by-idempotency-key bug. A recorded send is never touched, and a sweep
-     failure is logged without failing `initialize_database`.
+     failure is logged without changing what Dart sees.
 
 ### Security
 

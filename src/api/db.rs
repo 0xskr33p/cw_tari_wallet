@@ -122,7 +122,8 @@ pub fn disconnect_database() -> Result<()> {
 /// Heals inputs left `Locked` by a send that never got recorded (an app kill between
 /// reserving and recording, or the old release-by-idempotency-key bug). Upstream only
 /// releases `Pending` rows past `expires_at`, so a recorded send is never touched. A
-/// failure is logged rather than returned: `initialize_database` must not start failing.
+/// failure is logged rather than returned: the database init, send and scan that run it
+/// must not start failing.
 pub(crate) fn release_expired_reservations(conn: &r2d2_sqlite::rusqlite::Connection) {
     if let Err(e) = TransactionUnlocker::unlock_expired_transactions(conn) {
         log::warn!("Failed to release expired UTXO reservations: {e}");
