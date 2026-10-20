@@ -47,7 +47,8 @@ diff) before the version is tagged.
   `rusqlite` to 0.39 to share upstream's `libsqlite3-sys`.
 
   **No Dart contract change.** No declaration, field, variant, event or error
-  string changed; `make gen` changes only the `send_transaction` doc comment, and
+  string changed; `make gen` changes only the `send_transaction` doc comment and
+  FRB's ignored-items comment in `.dart/api/db.dart`, and
   `scripts/check_api_stability.sh` passes. The bump does change **runtime
   behaviour** that Cake Wallet should know about:
 
@@ -62,6 +63,16 @@ diff) before the version is tagged.
      `Network Error: …` now only comes from failures before the send is recorded.
      The node's answer is logged; exposing it to Dart is planned as a new additive
      API.
+
+     **Known risk (Medium):** a hostile *scan* node can plant an unmined output to
+     the wallet's address, because the light-wallet scan does not prove an output
+     is on chain. Input selection picks it first (largest first), so the send can
+     never be valid. At `af78477` the monitor gave up after 10 broadcast attempts
+     and unlocked the inputs; at `1ab7c8c` it never does, so the real inputs
+     selected with it stay locked permanently, even after switching to an honest
+     node, until the wallet is restored from seed. There is no theft, but it needs
+     only a hostile node. The SPEC-06 abandon/stalled APIs must ship before Cake
+     uses this rev.
   2. **Every send needs a change output.** Sending the whole balance fails with
      `Wallet Error: Failed to build transaction: Not enough funds for a change
      output: needs <shortfall> more to create a change output`.
@@ -77,7 +88,11 @@ diff) before the version is tagged.
      errors (`Failed to estimate fees`) for amounts that leave no room for change,
      such as send-max.
   7. **Fee estimates never go below the wallet's minimum fee per gram.**
-  8. **Two new DB migrations** run automatically on `initialize_database`.
+  8. **Two new DB migrations** (00033, 00034) run automatically on
+     `initialize_database`. They are forward-only: a pre-`1ab7c8c` bridge fails
+     `initialize_database` on an already-migrated DB, so rolling Cake back is not an
+     emergency hotfix path. Fix forward on `1ab7c8c`, or back up the DB before
+     upgrading.
 
 - Bumped the `minotari-cli` git pin from `52a7287` to `af78477` (tip of its
   default `main` branch) and the `tari_*` crates from `5.3.1-pre.0` to
