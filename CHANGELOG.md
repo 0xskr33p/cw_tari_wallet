@@ -38,6 +38,43 @@ diff) before the version is tagged.
 
 ### Changed
 
+- Bumped the `minotari-cli` git pin from `af78477` to `1ab7c8c` (tip of `main`,
+  minotari 0.3.x) and the `tari_*` crates from `5.7.0-pre.8` to `=6.2.0-pre.1`, in
+  both `Cargo.toml` and `verify/Cargo.toml`. The pin is exact because a caret
+  requirement resolves to `6.2.0` final, which `minotari` at `1ab7c8c` does not
+  compile against; every transitive `tari_*` crate is held at `6.2.0-pre.1` in
+  `Cargo.lock`. `tari_crypto` moved to 0.24, `r2d2_sqlite` to 0.34 and (verify)
+  `rusqlite` to 0.39 to share upstream's `libsqlite3-sys`.
+
+  **No Dart contract change.** No declaration, field, variant, event or error
+  string changed; `make gen` changes only the `send_transaction` doc comment, and
+  `scripts/check_api_stability.sh` passes. The bump does change **runtime
+  behaviour** that Cake Wallet should know about:
+
+  1. **A send the node does not accept no longer fails.** Upstream records the
+     send before broadcasting; if the node refuses it or cannot be reached,
+     `send_transaction` still emits `Completed` and resolves `Ok` with a `Pending`
+     `DisplayedTransactionDto`, and the scan's transaction monitor rebroadcasts it.
+     **Do not resend after `Ok`.** `Network Error: …` now only comes from failures
+     before the send is recorded. The node's answer is logged; exposing it to Dart
+     is planned as a new additive API.
+  2. **Every send needs a change output.** Sending the whole balance fails with
+     `Wallet Error: Failed to build transaction: Not enough funds for a change
+     output: needs <shortfall> more to create a change output`.
+  3. **Scan-driven confirmation.** The wallet's own sends are confirmed from the
+     block scan; only the scan can mark a send `Rejected`, and a reorg can return
+     it to `Pending`. Unmined sends are no longer counted as confirmed.
+  4. **The transaction monitor runs once per scan pass**, not after every batch,
+     so its `TransactionsUpdated` events arrive at the end of a pass. Base-node
+     errors while monitoring are retried next pass instead of failing the scan.
+  5. **`AccountBalanceDto.unconfirmed` includes a pending send's change** from the
+     moment of sending (upstream writes it as `UNCONFIRMED` at send time).
+  6. **Fee estimates always price a change output.** `estimate_transaction_fee`
+     errors (`Failed to estimate fees`) for amounts that leave no room for change,
+     such as send-max.
+  7. **Fee estimates never go below the wallet's minimum fee per gram.**
+  8. **Two new DB migrations** run automatically on `initialize_database`.
+
 - Bumped the `minotari-cli` git pin from `52a7287` to `af78477` (tip of its
   default `main` branch) and the `tari_*` crates from `5.3.1-pre.0` to
   `5.7.0-pre.8`, in both `Cargo.toml` and `verify/Cargo.toml` (the pins stay

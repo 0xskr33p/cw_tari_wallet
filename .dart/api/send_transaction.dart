@@ -15,9 +15,13 @@ import 'transactions.dart';
 /// Build, sign, and broadcast a one-sided transaction, streaming progress.
 ///
 /// Streams a [`SendTransactionEvent`] for each [`TransactionStage`] over `sink`
-/// and resolves to the broadcast [`DisplayedTransactionDto`]. `details` carries
-/// the **secret** seed words/passphrase and the recipient/amount (in microTari).
-/// Requires [`initialize_database`] first.
+/// and resolves to the recorded, `Pending` [`DisplayedTransactionDto`]. `details`
+/// carries the **secret** seed words/passphrase and the recipient/amount (in
+/// microTari). Requires [`initialize_database`] first.
+///
+/// `Ok` means the send is recorded, not necessarily accepted by the node; the
+/// scan's transaction monitor rebroadcasts it, so **do not resend after `Ok`**.
+/// `Network Error` only comes from failures before the send is recorded.
 ///
 /// Async and streamed. The send **continues even if the Dart stream is closed**
 /// (a half-broadcast transaction must finish) — this deliberately differs from

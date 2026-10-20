@@ -179,8 +179,10 @@ Two functions stream progress to Dart over an FRB `StreamSink`:
   These two are intentionally different; unifying them would be an observable
   behavior break.
 - **Terminal events.** A scan failure emits exactly one `ScanEventDto::Error` and
-  then resolves to `Err`. A send resolves to the broadcast `DisplayedTransactionDto`
-  or an `Err`.
+  then resolves to `Err`. A send resolves to the recorded, `Pending`
+  `DisplayedTransactionDto` (not necessarily accepted by the node yet; the scan's
+  monitor rebroadcasts it, so callers must not resend) or an `Err` for a failure
+  before the send was recorded.
 
 ## Lint policy
 
