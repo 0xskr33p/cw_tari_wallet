@@ -30,6 +30,7 @@ use r2d2_sqlite::SqliteConnectionManager;
 use std::{path::PathBuf, sync::RwLock};
 
 use minotari_wallet::init_db;
+use minotari_wallet::tasks::unlocker::TransactionUnlocker;
 
 /// The typed, encapsulated database state: the connection pool plus the on-disk
 /// path it was opened from. Owns the process-global singleton via [`DB_STATE`].
@@ -50,6 +51,11 @@ impl Database {
     /// any previously installed one.
     fn init(path: PathBuf) -> Result<()> {
         let pool = init_db(path.clone()).context("Failed to create database pool")?;
+
+        match pool.get() {
+            Ok(conn) => release_expired_reservations(&conn),
+            Err(e) => log::warn!("Could not check for expired UTXO reservations: {e}"),
+        }
 
         let mut guard = DB_STATE
             .write()
@@ -109,6 +115,19 @@ pub fn disconnect_database() -> Result<()> {
     // task could deadlock the FRB runtime) — cancellation is the cooperative signal.
     crate::api::scanner::cancel_active_scan()?;
     Database::disconnect()
+}
+
+/// Release UTXO reservations whose lock has expired, best-effort.
+///
+/// Heals inputs left `Locked` by a send that never got recorded (an app kill between
+/// reserving and recording, or the old release-by-idempotency-key bug). Upstream only
+/// releases `Pending` rows past `expires_at`, so a recorded send is never touched. A
+/// failure is logged rather than returned: the database init, send and scan that run it
+/// must not start failing.
+pub(crate) fn release_expired_reservations(conn: &r2d2_sqlite::rusqlite::Connection) {
+    if let Err(e) = TransactionUnlocker::unlock_expired_transactions(conn) {
+        log::warn!("Failed to release expired UTXO reservations: {e}");
+    }
 }
 
 pub(crate) fn get_db_connection() -> Result<PooledConnection<SqliteConnectionManager>> {

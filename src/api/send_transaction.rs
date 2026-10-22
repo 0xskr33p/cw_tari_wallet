@@ -1,5 +1,5 @@
 use crate::api::config::{DEFAULT_BASE_URL, DEFAULT_PASSPHRASE, SECONDS_TO_LOCK_UTXO};
-use crate::api::db::{get_db_connection, get_db_pool};
+use crate::api::db::{get_db_connection, get_db_pool, release_expired_reservations};
 use crate::api::error::WalletError;
 use crate::api::network::{apply_network, parse_network, TariNetwork};
 use crate::api::transactions::DisplayedTransactionDto;
@@ -123,20 +123,28 @@ where
     // `start_new_transaction` reserves any UTXO. Since the bump, `sign_locked_transaction`
     // verifies a payload-integrity signature made with the preparing wallet's view key,
     // so a seed/account mismatch fails at signing — by which point the inputs are already
-    // `Locked`, and nothing in this embedding ever unlocks them (see
-    // `release_send_reservation`). Checking first makes that mismatch cost nothing.
+    // `Locked` and must be released again (see `release_send_reservation`). Checking first
+    // makes that mismatch cost nothing.
     //
     // No stage event is emitted here: the streamed `TransactionStage` sequence is frozen
     // contract, so `SigningKeyGeneration` stays at its original position below.
     let key_manager = key_manager_from_seed_words(&seed_words)?;
     verify_seed_words_match_account(&details.wallet_name, &passphrase, &key_manager)?;
 
+    // Best-effort: free inputs a stale reservation still holds before selecting new ones.
+    match get_db_connection() {
+        Ok(conn) => release_expired_reservations(&conn),
+        Err(e) => log::warn!("Could not check for expired UTXO reservations: {e}"),
+    }
+
     report(
         TransactionStage::ConstructingTransaction,
         "Building transaction UTXOs...",
     );
-    // From here on UTXOs are reserved, so every failure path must release them.
-    let (idempotency_key, unsigned_tx) = build_unsigned_transaction(
+    // From here on UTXOs are reserved. Upstream releases them on most of its failure
+    // paths; the bridge releases on a signing failure and again as a backstop on a
+    // finalize failure, which does nothing once the send is recorded.
+    let (pending_transaction_id, unsigned_tx) = build_unsigned_transaction(
         &mut sender,
         validated.recipient_address,
         validated.amount,
@@ -163,7 +171,7 @@ where
     ) {
         Ok(tx) => tx,
         Err(e) => {
-            release_send_reservation(&idempotency_key);
+            release_send_reservation(&pending_transaction_id);
             return Err(map_signing_error(e).into());
         }
     };
@@ -181,35 +189,45 @@ where
     {
         Ok(tx) => tx,
         Err(e) => {
-            release_send_reservation(&idempotency_key);
+            release_send_reservation(&pending_transaction_id);
             return Err(WalletError::network(e.to_string()).into());
         }
     };
 
+    // The send is recorded either way; a send the node has not accepted is
+    // rebroadcast by the scan's transaction monitor and must not be retried.
+    if !result_tx.accepted_by_node {
+        log::warn!(
+            "Send recorded but not yet accepted by the node: note={:?}, node_reason={:?}",
+            result_tx.note,
+            result_tx.node_reason
+        );
+    }
+
     report(TransactionStage::Completed, "Transaction sent");
 
-    Ok(result_tx.into())
+    Ok(result_tx.displayed_transaction.into())
 }
 
 /// Release the UTXOs this send reserved, best-effort.
 ///
-/// `start_new_transaction` flips the selected outputs to `Locked` and commits. Upstream
-/// releases them again from `TransactionUnlocker::unlock_expired_transactions`, but that
-/// only ever runs from `minotari`'s **daemon**, which Cake Wallet does not link — it
-/// links this library. `fetch_unspent_outputs` has no expiry clause either, so nothing
-/// re-examines a stale lock: without this call `SECONDS_TO_LOCK_UTXO` is decorative and
-/// the lock is effectively permanent.
+/// `start_new_transaction` flips the selected outputs to `Locked` and commits. The only
+/// other release in this embedding is the expiry sweep (`release_expired_reservations`,
+/// run at database init and at the start of each send and scan), which waits out
+/// `SECONDS_TO_LOCK_UTXO`; this call hands them back straight away.
 ///
-/// `expire_and_unlock_pending_transaction` only acts while the row is still `Pending`, so
-/// it cannot hand back the inputs of a transaction that already reached the network.
+/// `pending_transaction_id` is the `pending_transactions` row id (not the idempotency
+/// key). `expire_and_unlock_pending_transaction` only acts while that row is still
+/// `Pending`, so it cannot hand back the inputs of a transaction that was recorded.
 ///
 /// Best-effort by design: this runs on an error path that already has a cause worth
 /// reporting, so a failure here is logged rather than allowed to mask the original error.
-fn release_send_reservation(idempotency_key: &str) {
+fn release_send_reservation(pending_transaction_id: &str) {
     let released = get_db_connection()
         .map_err(|e| e.to_string())
         .and_then(|conn| {
-            expire_and_unlock_pending_transaction(&conn, idempotency_key).map_err(|e| e.to_string())
+            expire_and_unlock_pending_transaction(&conn, pending_transaction_id)
+                .map_err(|e| e.to_string())
         });
 
     match released {
@@ -218,7 +236,7 @@ fn release_send_reservation(idempotency_key: &str) {
         Ok(false) => log::debug!("No pending UTXO reservation to release for a failed send"),
         Err(e) => log::warn!(
             "Failed to release the UTXO reservation for a failed send; these outputs stay \
-             locked until the account is rescanned: {e}"
+             locked until the reservation expires and the next send, scan or init sweeps it: {e}"
         ),
     }
 }
@@ -279,9 +297,14 @@ fn map_signing_error(e: TransactionBuilderError) -> WalletError {
 /// Build, sign, and broadcast a one-sided transaction, streaming progress.
 ///
 /// Streams a [`SendTransactionEvent`] for each [`TransactionStage`] over `sink`
-/// and resolves to the broadcast [`DisplayedTransactionDto`]. `details` carries
-/// the **secret** seed words/passphrase and the recipient/amount (in microTari).
-/// Requires [`initialize_database`] first.
+/// and resolves to the recorded, `Pending` [`DisplayedTransactionDto`]. `details`
+/// carries the **secret** seed words/passphrase and the recipient/amount (in
+/// microTari). Requires [`initialize_database`] first.
+///
+/// `Ok` means the send is recorded, not necessarily accepted by the node; the
+/// scan's transaction monitor rebroadcasts it, so **do not resend after `Ok`**.
+/// Rebroadcast only happens while `start_scan` runs.
+/// `Network Error` only comes from failures before the send is recorded.
 ///
 /// Async and streamed. The send **continues even if the Dart stream is closed**
 /// (a half-broadcast transaction must finish) — this deliberately differs from
@@ -343,9 +366,9 @@ fn create_transaction_sender(
 
 /// Reserve inputs and build the unsigned transaction.
 ///
-/// Returns the idempotency key alongside the payload: it identifies the pending row that
-/// now holds the `Locked` UTXOs, and the caller needs it to release them if any later
-/// step fails (see [`release_send_reservation`]).
+/// Returns the id of the pending row that now holds the `Locked` UTXOs alongside the
+/// payload; the caller needs it to release them if a later step fails (see
+/// [`release_send_reservation`]).
 fn build_unsigned_transaction(
     sender: &mut TransactionSender,
     address: TariAddress,
@@ -361,10 +384,10 @@ fn build_unsigned_transaction(
     let idempotency_key = uuid::Uuid::new_v4().to_string();
 
     let tx = sender
-        .start_new_transaction(idempotency_key.clone(), recipient, SECONDS_TO_LOCK_UTXO)
+        .start_new_transaction(idempotency_key, recipient, SECONDS_TO_LOCK_UTXO)
         .map_err(|e| WalletError::wallet(format!("Failed to build transaction: {}", e)))?;
 
-    Ok((idempotency_key, tx))
+    Ok((sender.processed_transactions.id().to_string(), tx))
 }
 
 #[cfg(test)]
@@ -612,6 +635,152 @@ mod tests {
             rendered.contains("some other signing failure"),
             "unrelated signing errors must pass through verbatim, got {rendered:?}"
         );
+    }
+
+    /// A temp wallet DB (no globals) holding one spendable output that
+    /// `build_unsigned_transaction` has reserved. Seeded the way upstream's own tests do.
+    /// Returns the temp dir (keep it alive), the pool, the output id and the pending row id.
+    fn reserve_one_output() -> (
+        tempfile::TempDir,
+        minotari_wallet::db::SqlitePool,
+        i64,
+        String,
+    ) {
+        use minotari_wallet::db::{
+            create_account, get_account_by_name, init_db, insert_output, insert_scanned_tip_block,
+            mark_output_confirmed,
+        };
+        use tari_common_types::seeds::cipher_seed::CipherSeed;
+        use tari_common_types::types::{FixedHash, PrivateKey};
+        use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
+        use tari_transaction_components::transaction_components::{MemoField, WalletOutput};
+
+        let dir = tempfile::tempdir().unwrap();
+        let pool = init_db(dir.path().join("wallet.db")).unwrap();
+        let conn = pool.get().unwrap();
+
+        let wallet =
+            WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
+        create_account(&conn, "test", &wallet, "pass").unwrap();
+        let account = get_account_by_name(&conn, "test").unwrap().unwrap();
+        insert_scanned_tip_block(&conn, account.id, 200, &[0u8; 32]).unwrap();
+
+        // One spendable output, mined and confirmed at 100 under a tip of 200.
+        let output = WalletOutput::new_from_parts(
+            Default::default(),
+            MicroMinotari(1_000_000),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            Default::default(),
+            0,
+            Default::default(),
+            Default::default(),
+            MicroMinotari(0),
+            None,
+            MemoField::new_empty(),
+            FixedHash::from([1u8; 32]),
+            Default::default(),
+        );
+        let output_id = insert_output(
+            &conn,
+            account.id,
+            &PrivateKey::default(),
+            vec![1u8; 32],
+            &output,
+            100,
+            &FixedHash::zero(),
+            1_700_000_000,
+            None,
+            None,
+            Default::default(),
+            false,
+        )
+        .unwrap();
+        mark_output_confirmed(&conn, &FixedHash::from([1u8; 32]), 100, &[0u8; 32]).unwrap();
+
+        let address = account.get_address(Network::LocalNet, "pass").unwrap();
+        let mut sender = TransactionSender::new(
+            pool.clone(),
+            "test".to_string(),
+            Zeroizing::new("pass".to_string()),
+            Network::LocalNet,
+            3,
+        )
+        .unwrap();
+        let (pending_id, _) =
+            build_unsigned_transaction(&mut sender, address, MicroMinotari(1_000), None).unwrap();
+
+        drop(conn);
+        (dir, pool, output_id, pending_id)
+    }
+
+    fn output_status(conn: &r2d2_sqlite::rusqlite::Connection, output_id: i64) -> String {
+        conn.query_row(
+            "SELECT status FROM outputs WHERE id = ?1",
+            [output_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Exception to the DB-free unit-test rule: a reservation released by the wrong id
+    /// leaves the user's UTXOs locked with no error, so this pins the id seam against a
+    /// real temp DB.
+    #[test]
+    fn reservation_is_released_by_pending_row_id_not_idempotency_key() {
+        use minotari_wallet::db::get_output_lock_request_id;
+
+        let (_dir, pool, output_id, pending_id) = reserve_one_output();
+        let conn = pool.get().unwrap();
+
+        assert_eq!(output_status(&conn, output_id), "LOCKED");
+        assert_eq!(
+            get_output_lock_request_id(&conn, output_id).unwrap(),
+            Some(pending_id.clone()),
+            "the returned id must be the pending row that holds the lock"
+        );
+
+        // The idempotency key is a different value and releases nothing.
+        let idempotency_key: String = conn
+            .query_row(
+                "SELECT idempotency_key FROM pending_transactions WHERE id = ?1",
+                [&pending_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(idempotency_key, pending_id);
+        assert!(!expire_and_unlock_pending_transaction(&conn, &idempotency_key).unwrap());
+        assert_eq!(output_status(&conn, output_id), "LOCKED");
+
+        // The pending row id releases the output.
+        assert!(expire_and_unlock_pending_transaction(&conn, &pending_id).unwrap());
+        assert_eq!(output_status(&conn, output_id), "UNSPENT");
+        assert_eq!(get_output_lock_request_id(&conn, output_id).unwrap(), None);
+    }
+
+    /// Exception to the DB-free unit-test rule (see above): the sweep run at database
+    /// init and at send/scan start releases a stale reservation but not a live one.
+    #[test]
+    fn expired_reservations_are_released_on_database_init() {
+        let (_dir, pool, output_id, pending_id) = reserve_one_output();
+        let conn = pool.get().unwrap();
+
+        // Not expired yet: the sweep leaves it alone.
+        crate::api::db::release_expired_reservations(&conn);
+        assert_eq!(output_status(&conn, output_id), "LOCKED");
+
+        // A reservation stranded long ago, e.g. by an app kill before recording.
+        conn.execute(
+            "UPDATE pending_transactions SET expires_at = '2000-01-01 00:00:00' WHERE id = ?1",
+            [&pending_id],
+        )
+        .unwrap();
+        crate::api::db::release_expired_reservations(&conn);
+        assert_eq!(output_status(&conn, output_id), "UNSPENT");
     }
 
     #[test]

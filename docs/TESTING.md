@@ -89,9 +89,14 @@ test.
   info / sync, transaction finalize/broadcast. No live RPC in unit tests.
 - **Anything needing a real wallet DB or the global singletons** — `get_address`,
   `get_transactions`, balance, scanning, and the DB-backed paths of
-  `send_transaction` (`create_transaction_sender`, `build_unsigned_transaction`,
-  `derive_key_manager`). These read process-global state (`get_db_pool` /
-  `get_db_connection`) that has no injection seam today.
+  `send_transaction` (`create_transaction_sender`, `derive_key_manager`). These read
+  process-global state (`get_db_pool` / `get_db_connection`) that has no injection
+  seam today. Deliberate exceptions:
+  `reservation_is_released_by_pending_row_id_not_idempotency_key` and
+  `expired_reservations_are_released_on_database_init` drive
+  `build_unsigned_transaction` and the expiry sweep against a temp DB (no
+  globals), because a reservation released wrongly leaves UTXOs locked with no
+  error.
 - **The FRB bridge surface** (`src/frb_generated.rs`, `.dart/**`) — generated code;
   covered mechanically by the bridge zero-diff check, not by unit tests.
 
