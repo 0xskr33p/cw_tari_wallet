@@ -71,6 +71,62 @@ diff) before the version is tagged.
 
 ### Changed
 
+- Bumped the `minotari-cli` git pin from `af78477` to `1ab7c8c` (tip of `main`,
+  minotari 0.3.x) and the `tari_*` crates from `5.7.0-pre.8` to `=6.2.0-pre.1`, in
+  both `Cargo.toml` and `verify/Cargo.toml`. The pin is exact because a caret
+  requirement resolves to `6.2.0` final, which `minotari` at `1ab7c8c` does not
+  compile against; every transitive `tari_*` crate is held at `6.2.0-pre.1` in
+  `Cargo.lock`. `tari_crypto` moved to 0.24, `r2d2_sqlite` to 0.34 and (verify)
+  `rusqlite` to 0.39 to share upstream's `libsqlite3-sys`.
+
+  **No Dart contract change.** No declaration, field, variant, event or error
+  string changed; `make gen` changes only the `send_transaction` doc comment and
+  FRB's ignored-items comment in `.dart/api/db.dart`, and
+  `scripts/check_api_stability.sh` passes. The bump does change **runtime
+  behaviour** that Cake Wallet should know about:
+
+  1. **A send the node does not accept no longer fails.** Upstream records the
+     send before broadcasting; if the node refuses it or cannot be reached,
+     `send_transaction` still emits `Completed` and resolves `Ok` with a `Pending`
+     `DisplayedTransactionDto`. Cake must present `Ok` as "submitted, pending"
+     (not "sent") and block re-sends while an earlier send is `Pending`. The inputs
+     of a send the node has not accepted stay locked until it confirms; the
+     transaction monitor rebroadcasts it only while `start_scan` runs, using the
+     scan's `base_url`, so switching to an honest node lets it go through.
+     `Network Error: …` now only comes from failures before the send is recorded.
+     The node's answer is logged; exposing it to Dart is planned as a new additive
+     API.
+
+     **Known risk (Medium):** a hostile *scan* node can plant an unmined output to
+     the wallet's address, because the light-wallet scan does not prove an output
+     is on chain. Input selection picks it first (largest first), so the send can
+     never be valid. At `af78477` the monitor gave up after 10 broadcast attempts
+     and unlocked the inputs; at `1ab7c8c` it never does, so the real inputs
+     selected with it stay locked permanently, even after switching to an honest
+     node, until the wallet is restored from seed. There is no theft, but it needs
+     only a hostile node. The SPEC-06 abandon/stalled APIs must ship before Cake
+     uses this rev.
+  2. **Every send needs a change output.** Sending the whole balance fails with
+     `Wallet Error: Failed to build transaction: Not enough funds for a change
+     output: needs <shortfall> more to create a change output`.
+  3. **Scan-driven confirmation.** The wallet's own sends are confirmed from the
+     block scan; only the scan can mark a send `Rejected`, and a reorg can return
+     it to `Pending`. Unmined sends are no longer counted as confirmed.
+  4. **The transaction monitor runs once per scan pass**, not after every batch,
+     so its `TransactionsUpdated` events arrive at the end of a pass. Base-node
+     errors while monitoring are retried next pass instead of failing the scan.
+  5. **`AccountBalanceDto.unconfirmed` includes a pending send's change** from the
+     moment of sending (upstream writes it as `UNCONFIRMED` at send time).
+  6. **Fee estimates always price a change output.** `estimate_transaction_fee`
+     errors (`Failed to estimate fees`) for amounts that leave no room for change,
+     such as send-max.
+  7. **Fee estimates never go below the wallet's minimum fee per gram.**
+  8. **Two new DB migrations** (00033, 00034) run automatically on
+     `initialize_database`. They are forward-only: a pre-`1ab7c8c` bridge fails
+     `initialize_database` on an already-migrated DB, so rolling Cake back is not an
+     emergency hotfix path. Fix forward on `1ab7c8c`, or back up the DB before
+     upgrading.
+
 - Bumped the `minotari-cli` git pin from `52a7287` to `af78477` (tip of its
   default `main` branch) and the `tari_*` crates from `5.3.1-pre.0` to
   `5.7.0-pre.8`, in both `Cargo.toml` and `verify/Cargo.toml` (the pins stay
@@ -140,13 +196,23 @@ diff) before the version is tagged.
   practice **permanent**. Combined with the new signing precondition below and a
   fresh random idempotency key per attempt, a user who mistyped one seed word and
   retried could permanently lock a different UTXO set each time, recoverable only
-  by deleting the DB and rescanning. Two changes close this:
+  by deleting the DB and rescanning. Three changes close this:
   1. `send_transaction` now verifies the supplied seed words control the account
      **before** reserving anything, so the common mismatch costs nothing.
-  2. Any failure after the reservation (signing or broadcast) now releases it via
-     `db::expire_and_unlock_pending_transaction`, which only acts while the row is
-     still `Pending` and so can never hand back the inputs of a transaction that
-     already reached the network.
+  2. A signing or finalize failure after the reservation now releases it via
+     `db::expire_and_unlock_pending_transaction`, keyed by the pending row's id (not
+     the idempotency key, which matched no row and released nothing). It only acts
+     while the row is still `Pending`, so it can never hand back the inputs of a
+     recorded transaction. Upstream releases on most of its finalize failure paths;
+     the bridge releases again as a backstop, which does nothing once the send is
+     recorded.
+  3. `initialize_database`, and the start of each `send_transaction` and
+     `start_scan`, now run upstream's expiry sweep
+     (`TransactionUnlocker::unlock_expired_transactions`), best-effort. It
+     releases reservations still `Pending` past `expires_at`, healing inputs
+     stranded by an app kill between reserving and recording, or by the earlier
+     release-by-idempotency-key bug. A recorded send is never touched, and a sweep
+     failure is logged without changing what Dart sees.
 
 ### Security
 

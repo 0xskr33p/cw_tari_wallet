@@ -144,14 +144,17 @@ These values are byte-for-byte what they were before consolidation and are pinne
 by value-guard tests.
 
 `SECONDS_TO_LOCK_UTXO` is **not** a duration after which the lock lifts by itself.
-It is handed to upstream's `start_new_transaction` as the reservation's `expires_at`,
-but nothing in this embedding ever processes that expiry: upstream releases expired
-reservations from `TransactionUnlocker::unlock_expired_transactions`, which only runs
-in `minotari`'s daemon (Cake Wallet links this library, not the daemon), and
-`fetch_unspent_outputs` selects on `status` with no expiry clause. Reserved UTXOs are
-therefore released only by an explicit call — `finalize_transaction_and_broadcast` on
-its own failure paths, or `release_send_reservation` on the bridge's. A process kill
-between reserving and broadcasting still strands them until the account is rescanned. `DEFAULT_BASE_URL` is **not** derived from the requested
+It is handed to upstream's `start_new_transaction` as the reservation's `expires_at`.
+Upstream's daemon sweeps expired reservations every minute, but Cake Wallet links this
+library, not the daemon, and `fetch_unspent_outputs` selects on `status` with no expiry
+clause. Reserved UTXOs are released by `finalize_transaction_and_broadcast` on most of
+its own failure paths, by `release_send_reservation` (by pending-row id) when signing
+or finalize fails (a backstop that does nothing once the send is recorded), and by a
+`TransactionUnlocker::unlock_expired_transactions` sweep at `initialize_database`, at
+the start of each send and at the start of each scan (best-effort; it only releases
+`Pending` rows past `expires_at`). So a reservation the bridge fails to release (e.g. a
+process kill between reserving and recording) stays locked until it expires and the
+next init, send or scan runs. `DEFAULT_BASE_URL` is **not** derived from the requested
 network (deriving it would change observable behavior — a deferred, coordinated
 change).
 
@@ -178,8 +181,10 @@ Two functions stream progress to Dart over an FRB `StreamSink`:
   These two are intentionally different; unifying them would be an observable
   behavior break.
 - **Terminal events.** A scan failure emits exactly one `ScanEventDto::Error` and
-  then resolves to `Err`. A send resolves to the broadcast `DisplayedTransactionDto`
-  or an `Err`.
+  then resolves to `Err`. A send resolves to the recorded, `Pending`
+  `DisplayedTransactionDto` (not necessarily accepted by the node yet; the scan's
+  monitor rebroadcasts it, so callers must not resend) or an `Err` for a failure
+  before the send was recorded.
 
 ## Lint policy
 

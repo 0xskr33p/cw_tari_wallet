@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `disconnect`, `get_db_connection`, `get_db_path`, `get_db_pool`, `init`, `with_current`
+// These functions are ignored because they are not marked as `pub`: `disconnect`, `get_db_connection`, `get_db_path`, `get_db_pool`, `init`, `release_expired_reservations`, `with_current`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `Database`
 
 /// Open (or create) the wallet SQLite database at `path` and install it as the

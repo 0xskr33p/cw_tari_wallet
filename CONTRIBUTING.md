@@ -181,6 +181,8 @@ the frozen contract. Never bypass it on a dependency PR.
 - `minotari` is pinned to the **main revision `1ab7c8c651b2937a8b05fba9d5a432cf633ae3f8`**
   (the merged scan-driven confirmation fix, #149; still reports package 0.3.0); `tari_common` / `tari_common_types` / `tari_hashing` /
   `tari_transaction_components` are pinned exactly to `=6.2.0-pre.1`;
+  The transitive crates are held at this pre-release in `Cargo.lock` to avoid
+  resolving incompatible final releases;
   `flutter_rust_bridge` is pinned **exactly** `=2.11.1`.
 - Keep the transitive `tari_*` crates on the same `6.2.0-pre.1` release in
   `Cargo.lock`. The wrapper uses `tari_crypto` 0.24 and the same SQLite

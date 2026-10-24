@@ -8,16 +8,21 @@ import 'network.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 import 'transactions.dart';
 
-// These functions are ignored because they are not marked as `pub`: `build_unsigned_transaction`, `create_transaction_sender`, `map_signing_error`, `release_send_reservation`, `validate_confirmed_fee`, `validate_inputs`, `verify_seed_words_match_account`
+// These functions are ignored because they are not marked as `pub`: `build_unsigned_transaction`, `create_transaction_sender`, `map_signing_error`, `release_send_reservation_by_key`, `release_send_reservation`, `validate_confirmed_fee`, `validate_inputs`, `verify_seed_words_match_account`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `clone`, `fmt`
 // These functions are ignored (category: IgnoreBecauseExplicitAttribute): `send_transaction_with_fee_handler`, `send_transaction_with_handler`
 
 /// Build, sign, and broadcast a one-sided transaction, streaming progress.
 ///
 /// Streams a [`SendTransactionEvent`] for each [`TransactionStage`] over `sink`
-/// and resolves to the broadcast [`DisplayedTransactionDto`]. `details` carries
-/// the **secret** seed words/passphrase and the recipient/amount (in microTari).
-/// Requires [`initialize_database`] first.
+/// and resolves to the recorded, `Pending` [`DisplayedTransactionDto`]. `details`
+/// carries the **secret** seed words/passphrase and the recipient/amount (in
+/// microTari). Requires [`initialize_database`] first.
+///
+/// `Ok` means the send is recorded, not necessarily accepted by the node; the
+/// scan's transaction monitor rebroadcasts it, so **do not resend after `Ok`**.
+/// Rebroadcast only happens while `start_scan` runs.
+/// `Network Error` only comes from failures before the send is recorded.
 ///
 /// Async and streamed. The send **continues even if the Dart stream is closed**
 /// (a half-broadcast transaction must finish) — this deliberately differs from
