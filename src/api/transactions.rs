@@ -1,5 +1,5 @@
 use crate::api::{db::get_db_connection, error::WalletError, utils::format_micro_tari};
-use crate::domain::history::{kernel_fee, normalize_local_send};
+use crate::domain::history::{kernel_fee, normalize_local_send, recovered_send_fee};
 use crate::domain::history_changes::{HistoryChanges, ScanHistoryChanges};
 use anyhow::{Context, Result};
 use flutter_rust_bridge::frb;
@@ -410,12 +410,37 @@ fn history_dto(
 ) -> Result<DisplayedTransactionDto> {
     restore_mined_block_hash(conn, &mut tx)?;
     if tx.direction == minotari_wallet::transactions::TransactionDirection::Outgoing {
+        let mut normalized = false;
         if let Some(completed) = minotari_wallet::db::get_completed_transaction_by_id(conn, tx.id)?
         {
             if completed.account_id == tx.details.account_id {
                 let signed: Transaction = serde_json::from_slice(&completed.serialized_transaction)
                     .context("Failed to read signed transaction for wallet history")?;
                 normalize_local_send(&mut tx, kernel_fee(&signed)?);
+                normalized = true;
+            }
+        }
+        if !normalized {
+            let mut recovered_fee = None;
+            if let [output] = tx.details.outputs.as_slice() {
+                if let Some((_, output_tx, change)) =
+                    minotari_wallet::db::get_output_info_by_hash_for_account(
+                        conn,
+                        tx.details.account_id,
+                        &output.hash,
+                    )?
+                {
+                    if output_tx == tx.id {
+                        recovered_fee = recovered_send_fee(&tx, &change);
+                    }
+                }
+            }
+            if let Some(fee) = recovered_fee {
+                normalize_local_send(&mut tx, fee);
+            } else {
+                // No verified local kernel or consistent reconstruction: keep
+                // the known net debit, without inventing a fee of zero.
+                tx.fee = None;
             }
         }
     }
@@ -517,6 +542,25 @@ mod tests {
 
     const RECEIVED_PAYREF: &str =
         "9cb2bb582664d051387c2d40ed638be2d7d98226b64ced71f90827a8e73f5a1a";
+
+    #[test]
+    fn an_outgoing_without_signed_or_reconstructed_fee_keeps_its_debit_and_unknown_fee() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = minotari_wallet::init_db(dir.path().join("wallet.db")).unwrap();
+        let conn = pool.get().unwrap();
+        let mut tx = received_transaction();
+        tx.direction = TransactionDirection::Outgoing;
+        tx.amount = MicroMinotari(25_000_700);
+        tx.fee = Some(minotari_wallet::transactions::FeeInfo {
+            amount: MicroMinotari(0),
+        });
+        let dto = history_dto(&conn, tx).unwrap();
+        assert_eq!(dto.amount, 25_000_700);
+        assert!(dto.fee.is_none(), "unknown must not be displayed as zero");
+        let incoming = history_dto(&conn, received_transaction()).unwrap();
+        assert_eq!(incoming.amount, 100_000_000);
+        assert!(incoming.fee.is_none());
+    }
 
     #[test]
     fn mined_receipt_crosses_confirmation_threshold_and_keeps_its_reference() {
