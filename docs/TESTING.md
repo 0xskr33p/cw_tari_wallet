@@ -1,6 +1,6 @@
 # Testing strategy
 
-This document describes how `rust_lib_flutter_rust_wallet` is tested, what is
+This document describes how `minotari_wallet_ffi` is tested, what is
 intentionally **not** tested yet, and which tests are **contract guards** that must
 not be flipped casually. It is the convention every later step extends.
 
@@ -44,9 +44,12 @@ alongside the colocated unit tests. The suite must stay green and hermetic.
 | `api/logger.rs` | `From<LogLevel> for LevelFilter` — all 6 variants. | Upstream-drift tripwire for `log::LevelFilter`. |
 | `api/fee.rs` | `From<FeePriority> for LibFeePriority` — all 3 variants. | Upstream-drift tripwire for `minotari`'s `FeePriority`. |
 | `api/transactions.rs` | `From` for `DisplayedTransactionDirection` (2), `DisplayedTransactionSource` (4), `DisplayedTransactionStatus` (7) — all variants. | Upstream-drift tripwires for the `minotari` transaction enums. |
-| `api/send_transaction.rs` | `validate_inputs`: rejects zero amount, rejects malformed recipient, accepts a good fixture, applies the `DEFAULT_CONFIRMATION_WINDOW` (3) default, and honours an explicit window. | Input validation is pure (no DB/network) and gates every send. |
+| `domain/abandon.rs` | Pairing stored wallet events into after-abandon warnings: abandoned then mined → `MinedAfterAbandon`; rejected for another reason then mined → none; abandoned, never mined → none; `TransactionAcceptedAfterAbandon` → `AcceptedAfterAbandon`; ordering by event id; the batch-id filter behind `abandoned_then_mined_ids`; every `WalletEventType` variant's role (exhaustive `match`); which released inputs a conflicting resend requires, and the shared-input check. | Upstream-drift tripwire for `minotari`'s `WalletEventType`: a new variant fails the build until its role is decided. Tier A covers the real path (abandon, then a scan mines the original). |
+| `api/send_transaction.rs` | `validate_inputs`: rejects zero amount, rejects malformed recipient, accepts a good fixture, applies the `DEFAULT_CONFIRMATION_WINDOW` (3) default, honours an explicit window, and parses `conflicts_with_transaction_id` (`Wallet Error: Invalid transaction id` otherwise). The three resend refusal strings are characterised; an unknown send is not an abandoned one; a built resend sharing no input with the original is refused and its reservation released. Tier A: {10, 3} T, send 3 T, abandon, receive 50 T; the conflicting resend spends the released 10 (not the 50) and the plain one spends the 50; refusals for a send that is not abandoned, another wallet's, and released inputs all spent again. | Input validation is pure (no DB/network) and gates every send. |
 | `api/base_node.rs` | `check_node_health`: an unparseable `base_url` returns `Ok(false)` (never `Err`); reachability itself is `is_online`, covered hermetically by the Tier-B harness. `api/config.rs` value-guards pin `HEALTH_TIMEOUT_SECS` (5) and `HEALTH_MAX_RETRIES` (1). | The probe must map to a plain Dart `bool`; a bad URL is "not healthy", not an error. Pinned timeout/retry are the snappy "test connection" UX. |
-| `api/signing.rs` + `domain/signing.rs` | sign/verify round-trip, tamper/wrong-key → false, malformed-input error strings, random-nonce non-determinism, frozen domain tag, reference cross-compat vector. | Off-chain message signing; pure crypto; the error strings + domain tag are frozen contract. |
+| `api/signing.rs` (over `minotari::signing`) | sign (through the session; `Wallet is locked` otherwise)/verify round-trip, tamper/wrong-key → false, malformed-input error strings, random-nonce non-determinism, frozen domain tag, reference cross-compat vector. | Off-chain message signing; the error strings + domain tag are contract. |
+| `api/db.rs` | Two unlocks need two locks (pool and session survive the first); the last lock closes the pool and a later unlock reopens it; a wrong passphrase is refused even while the wallet is unlocked (count unchanged); `lock_wallet` returns whether it locked; `force_lock_wallet` releases every holder, and wins over an unlock waiting for the wallet's gate (`Locked`, no session, count or pool left), without wiping a newer holder that took the gate first, and cancels a scan started in that gap; a key read after the session is gone is `Locked` even when the empty passphrase would decrypt; a failed unlock holds nothing, and one that fails after the wallet was locked and unlocked again leaves the newer holder's count, session and pool alone; another path while unlocked is refused; `checkpoint_database` truncates the `-wal` with and without a session. | The DB/session lifetime both Cake engines share. |
+| `api/scanner.rs` | Foreground supersedes Background (`Superseded`), Background during Foreground is refused; same priority replaces; a stale handle stops nothing; wallets A and B scan side by side and stopping A leaves B; locked wallet / reused handle / early stop each end with exactly one terminal event; a start waits for its wallet's maintenance, a stop meanwhile cancels it, and another wallet's maintenance does not delay it; an out-of-range rescan replaces nothing; forwarder ordering and terminal hand-off. | Per-wallet scan ownership. The full scan needs a node, so slot rules use stand-in scans and the real start path is stopped before it reaches the node (Tier A covers a real scan against a mock node). |
 
 ## Contract-guard tests (do not flip without coordination)
 
@@ -61,13 +64,18 @@ test.
   the resolved value or the signature.
 - **`network.rs::from_str_esme_is_alias_for_esmeralda`** — the `"esme"` alias maps to
   `Esmeralda`.
-- **The enum-mapping tests** (`logger`, `fee`, `transactions`, and
+- **The enum-mapping tests** (`logger`, `fee`, `transactions`,
+  `domain/abandon.rs::every_event_variant_has_a_decided_role`, and
   `tari_network_maps_to_lib_network_exhaustively`) — these are exhaustive on purpose.
   A `minotari`/`tari_common`/`log` bump that adds or renames a variant should break
   compilation or these tests, **not** silently mismap. When that happens, revisit the
   `From` impl and the test together.
 - **`send_transaction.rs::validate_inputs` tests** — encode the accept/reject and
   default-window behavior of the validation gate.
+- **`error.rs::display_strings_match_legacy_contract`** — every Dart-visible error
+  string, including the v0.2 `Wallet is locked`,
+  `The new wallet name is the same as the current one` and
+  `A foreground scan of this wallet is already running`.
 - **`signing.rs::signing_error_strings_are_frozen`** — the three Dart-visible signing
   error strings (`signature must be in '<signature_hex>|<public_nonce_hex>' format`,
   `invalid signature component`, `invalid public nonce`), driven through the public
@@ -82,6 +90,10 @@ test.
   external reference binary), but it shares the exact `tari_crypto`/`tari_hashing` sign
   path with the canonical Tari wallet; executing it against a running reference binary
   is an unverified follow-up.
+- **`send_transaction.rs::resend_refusal_strings_are_frozen`** — the three
+  Dart-visible refusals of a send with `conflicts_with_transaction_id`
+  (`… is not an abandoned send of this wallet`, `None of the abandoned send's inputs
+  can be spent; …`, `The resend does not conflict with the abandoned send`).
 
 ## Intentionally not tested yet (and why)
 
@@ -89,9 +101,13 @@ test.
   info / sync, transaction finalize/broadcast. No live RPC in unit tests.
 - **Anything needing a real wallet DB or the global singletons** — `get_address`,
   `get_transactions`, balance, scanning, and the DB-backed paths of
-  `send_transaction` (`create_transaction_sender`, `derive_key_manager`). These read
+  `send_transaction` (`create_transaction_sender`, `stored_key_manager`). These read
   process-global state (`get_db_pool` / `get_db_connection`) that has no injection
-  seam today. Deliberate exceptions:
+  seam today. Deliberate exceptions (temp DBs, holding `GLOBAL_STATE_TEST_LOCK`
+  where they touch the globals): the session-count, pool lifecycle and checkpoint
+  tests in `db.rs`; the scan-slot, handle and maintenance tests in `scanner.rs`
+  (driven with stand-in scans, or a real start that stops right before contacting a
+  node); the locked/unlocked send and sign tests, including a lock between loading the keys and the build (empty and non-empty passphrase); and
   `reservation_is_released_by_pending_row_id_not_idempotency_key` and
   `expired_reservations_are_released_on_database_init` drive
   `build_unsigned_transaction` and the expiry sweep against a temp DB (no
@@ -115,7 +131,7 @@ Three tiers:
 
 | Tier | Where | What | When |
 |------|-------|------|------|
-| **A — fixture replay** | `verify/tests/tier_a_fixture_replay.rs` | Rebuilds a deterministic, **view-only** wallet DB into a temp dir, `initialize_database` → asserts `list_wallets` / `get_address` / `get_balance` / `get_transactions` golden values; `insta` snapshots pin every DTO's shape + content. | Every PR (hermetic) |
+| **A — fixture replay** | `verify/tests/tier_a_fixture_replay.rs` | Rebuilds a deterministic, **view-only** wallet DB into a temp dir, `set_database_path` / `unlock_wallet` → asserts `list_wallets` / `get_address` / `get_balance` / `get_transactions` golden values; `insta` snapshots pin every DTO's shape + content. | Every PR (hermetic) |
 | **B — recorded RPC** | `verify/tests/tier_b_recorded_rpc.rs` | A local `wiremock` server replays committed `get_tip_info` JSON captures; `get_tip_info` / `is_node_synced` are pointed at it via `base_url` and asserted to parse (frozen-contract APIs, ledger D2). | Every PR (hermetic) |
 | **C — live smoke** | `verify` bin, feature `live-e2e` | Non-interactive scenario runner: restore a known esmeralda wallet → scan to tip → assert balance/tx count. Secrets from env vars, never committed/interactive, zeroized in memory. | Nightly only — **never on PRs** |
 
@@ -133,10 +149,10 @@ exact bytes.
 
 ### Global-state discipline in integration tests
 
-The DB-backed read APIs funnel through the single process-global DB slot
-(`initialize_database`). Tier A tests therefore mutate shared global state: they
-are serialized with a local `SERIAL` mutex and each one calls `disconnect_database`
-on exit. (Cross-binary they cannot race: `cargo test` runs each test binary
+The DB-backed APIs funnel through the process-global database path and wallet
+sessions (`set_database_path` / `unlock_wallet`). Tier A tests therefore mutate
+shared global state: they are serialized with a local `SERIAL` mutex and each one
+locks the wallets it unlocked on exit (`DbGuard`). (Cross-binary they cannot race: `cargo test` runs each test binary
 sequentially.) Do **not** add parallel integration tests that race the global DB
 slot.
 

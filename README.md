@@ -4,7 +4,7 @@ A [flutter_rust_bridge](https://github.com/fzyzcjy/flutter_rust_bridge) (FRB)
 binding that wraps the [Tari](https://www.tari.com/)
 [`minotari`](https://github.com/tari-project/minotari-cli) wallet for use from a
 Flutter app. The Rust crate
-(`rust_lib_flutter_rust_wallet`) compiles to native libraries; FRB generates the
+(`minotari_wallet_ffi`) compiles to native libraries; FRB generates the
 Dart glue. It is the wallet backend consumed by [Cake Wallet](https://cakewallet.com).
 
 The crate exposes a focused surface: database lifecycle, wallet
@@ -80,6 +80,21 @@ cargo build --all-targets     # host build — validates all three crate types
 
 The host build is the merge gate. Cross-compiling for Android/iOS needs a full
 Flutter/NDK toolchain and is out of scope for CI today (tracked as a follow-up).
+
+## Integrating (Cake Wallet)
+
+Call `initLogger(basePath: appDir)` once at startup, before any other bridge
+call. Rust logs then go only to the rotating `<appDir>/logs/minotari.log`; release
+builds write nothing to logcat or os_log. Later calls are no-ops. Use
+`setLogLevel(level: ...)` to change the level at runtime (e.g. a debug toggle).
+
+Build release libraries with `make release-android` / `make release-ios` (also
+`release-macos`, `release-linux`, `release-windows`; optionally `TARGET=<triple>`;
+mainnet network group unless `TARI_TARGET_NETWORK` is set),
+i.e. `cargo rustc --release --locked --lib --crate-type cdylib|staticlib`; a plain
+`cargo build --release` silently skips LTO. Tagged releases ship prebuilt libraries
+for every platform plus the Dart bindings; see
+[Native release artifacts](./CONTRIBUTING.md#native-release-artifacts).
 
 ## The codegen workflow
 

@@ -1,65 +1,14 @@
 use crate::api::{db::get_db_connection, error::WalletError, utils::format_micro_tari};
 use crate::domain::history::{kernel_fee, normalize_local_send, recovered_send_fee};
-use crate::domain::history_changes::{HistoryChanges, ScanHistoryChanges};
 use anyhow::{Context, Result};
 use flutter_rust_bridge::frb;
 use minotari_wallet::{
-    db::{
-        get_displayed_transactions_needing_confirmation_update,
-        get_displayed_transactions_paginated, get_latest_scanned_tip_block_by_account,
-        update_displayed_transaction_confirmations,
-    },
-    get_accounts,
-    utils::timestamp::format_timestamp,
+    db::get_displayed_transactions_paginated, get_accounts, utils::timestamp::format_timestamp,
 };
-use once_cell::sync::Lazy;
 use r2d2_sqlite::rusqlite::{Connection, OptionalExtension};
-use std::sync::Mutex;
 use tari_common_types::{payment_reference::generate_payment_reference, types::FixedHash};
 use tari_transaction_components::transaction_components::Transaction;
 use tari_utilities::ByteArray;
-
-static HISTORY_CHANGES: Lazy<Mutex<HistoryChanges>> =
-    Lazy::new(|| Mutex::new(HistoryChanges::default()));
-
-pub(crate) fn record_transaction_changes(account: i64, ids: impl IntoIterator<Item = String>) {
-    HISTORY_CHANGES
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .record(account, ids);
-}
-
-pub(crate) fn begin_scan_history_changes() -> ScanHistoryChanges {
-    HISTORY_CHANGES
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .begin_scan()
-}
-
-pub(crate) fn record_scan_transaction_changes(
-    scan: &mut ScanHistoryChanges,
-    account: i64,
-    ids: impl IntoIterator<Item = String>,
-) {
-    HISTORY_CHANGES
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .record_scan(scan, account, ids);
-}
-
-pub(crate) fn finish_scan_history_changes(scan: ScanHistoryChanges) {
-    HISTORY_CHANGES
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .finish_scan(scan);
-}
-
-pub(crate) fn reset_transaction_changes() {
-    HISTORY_CHANGES
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clear();
-}
 /// Fee charged on a transaction: `amount` in **microTari** plus a pre-formatted
 /// `amount_display` string for the UI.
 #[frb]
@@ -199,6 +148,8 @@ pub struct DisplayedTransactionDto {
     pub status: DisplayedTransactionStatus,
     pub amount: u64,
     pub amount_display: String,
+    /// Payer-controlled memo text, passed through unaltered (it can double as a
+    /// payment ID). Render it as plain, bidi-isolated text.
     pub message: Option<String>,
     pub counterparty: Option<CounterpartyInfoDto>,
     pub blockchain: BlockchainInfoDto,
@@ -286,7 +237,7 @@ impl From<minotari_wallet::DisplayedTransaction> for DisplayedTransactionDto {
 /// List a page of the wallet's transactions, most recent first.
 ///
 /// `limit`/`offset` paginate the result. Requires
-/// [`initialize_database`](crate::api::db::initialize_database) first.
+/// a database path (`set_database_path` or `unlock_wallet`) first.
 /// Synchronous; errors if the account does not exist.
 #[frb]
 pub fn get_transactions(
@@ -304,49 +255,6 @@ pub fn get_transactions(
         .into_iter()
         .map(|tx| history_dto(&conn, tx))
         .collect()
-}
-
-/// Read and acknowledge transactions changed by this process's scan/send events.
-///
-/// Returns current canonical history DTOs, including reorg changes, for this wallet
-/// only. Empty cycles read no history rows. Failed reads retain pending IDs, and
-/// concurrent updates remain pending. Load the full paginated history on opening:
-/// this in-memory notification queue is not a persistent history or a cursor.
-/// `transaction_ids` optionally includes IDs received in scan events; foreign or
-/// missing IDs are ignored. It does not change the scan event contract.
-#[frb]
-pub fn get_changed_transactions(
-    wallet_name: String,
-    transaction_ids: Option<Vec<String>>,
-) -> Result<Vec<DisplayedTransactionDto>> {
-    let mut conn = get_db_connection()?;
-    let account = get_accounts(&mut conn, Some(&wallet_name))?
-        .into_iter()
-        .next()
-        .ok_or(WalletError::NoAccounts)?;
-    if let Some(ids) = transaction_ids {
-        record_transaction_changes(account.id, ids);
-    }
-    let read = HISTORY_CHANGES
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .pending(account.id);
-    let mut changed = Vec::with_capacity(read.len());
-    for (id, _) in &read {
-        let json: Option<String> = conn.query_row(
-            "SELECT transaction_json FROM displayed_transactions WHERE account_id = ?1 AND id = ?2",
-            (account.id, id), |row| row.get(0),
-        ).optional()?;
-        if let Some(json) = json {
-            let tx = serde_json::from_str(&json).context("Invalid changed transaction history")?;
-            changed.push(history_dto(&conn, tx)?);
-        }
-    }
-    HISTORY_CHANGES
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .acknowledge(account.id, &read);
-    Ok(changed)
 }
 
 fn restore_mined_block_hash(
@@ -404,7 +312,7 @@ fn restore_mined_block_hash(
     Ok(false)
 }
 
-fn history_dto(
+pub(crate) fn history_dto(
     conn: &Connection,
     mut tx: minotari_wallet::DisplayedTransaction,
 ) -> Result<DisplayedTransactionDto> {
@@ -447,78 +355,6 @@ fn history_dto(
     Ok(tx.into())
 }
 
-/// Refresh mined Pending/Unconfirmed/Locked entries using this account's scanned tip.
-///
-/// Legacy compatibility API for minotari v0.3.0's skipped monitor. The pinned
-/// main revision fixes that monitor; Cake now consumes scan updates instead.
-/// Unmined sends and removed transactions are preserved.
-/// Returns changed entries; existing scan events and read APIs are unchanged.
-#[frb]
-pub fn refresh_transaction_confirmations(
-    wallet_name: String,
-    required_confirmations: Option<u64>,
-) -> Result<Vec<DisplayedTransactionDto>> {
-    let required =
-        required_confirmations.unwrap_or(crate::api::config::DEFAULT_CONFIRMATION_WINDOW);
-    anyhow::ensure!(
-        required > 0,
-        "Required confirmations must be greater than zero"
-    );
-    let mut conn = get_db_connection()?;
-    let account = get_accounts(&mut conn, Some(&wallet_name))?
-        .into_iter()
-        .next()
-        .ok_or(WalletError::NoAccounts)?;
-    let snapshot = conn.transaction()?;
-    let Some(tip) = get_latest_scanned_tip_block_by_account(&snapshot, account.id)? else {
-        return Ok(Vec::new());
-    };
-    let mut updated = Vec::new();
-    for mut tx in get_displayed_transactions_needing_confirmation_update(&snapshot, account.id)? {
-        let repaired_hash = restore_mined_block_hash(&snapshot, &mut tx)?;
-        if refresh_mined_status(&mut tx, tip.height, required) || repaired_hash {
-            update_displayed_transaction_confirmations(&snapshot, &tx)?;
-            updated.push(history_dto(&snapshot, tx)?);
-        }
-    }
-    snapshot.commit()?;
-    Ok(updated)
-}
-
-fn refresh_mined_status(
-    tx: &mut minotari_wallet::DisplayedTransaction,
-    scanned_height: u64,
-    required: u64,
-) -> bool {
-    use minotari_wallet::transactions::TransactionDisplayStatus as Status;
-    if !matches!(
-        tx.status,
-        Status::Pending | Status::Unconfirmed | Status::Locked
-    ) || tx.blockchain.block_height == 0
-        || tx.blockchain.block_height > scanned_height
-    {
-        return false;
-    }
-    let confirmations = scanned_height.saturating_sub(tx.blockchain.block_height);
-    let status = if confirmations >= required {
-        if tx.lock_height > scanned_height {
-            Status::Locked
-        } else {
-            Status::Confirmed
-        }
-    } else if confirmations > 0 {
-        Status::Unconfirmed
-    } else {
-        Status::Pending
-    };
-    if confirmations == tx.blockchain.confirmations && status == tx.status {
-        return false;
-    }
-    tx.blockchain.confirmations = confirmations;
-    tx.status = status;
-    true
-}
-
 #[cfg(test)]
 mod tests {
     //! Enum-mapping tests. Pure conversions, no I/O. These are upstream-drift
@@ -530,14 +366,14 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
-    use minotari_wallet::models::OutputStatus;
     use minotari_wallet::transactions::{
-        BlockchainInfo, TransactionDetails, TransactionDirection, TransactionDisplayStatus,
-        TransactionOutput, TransactionSource,
+        TransactionDirection, TransactionDisplayStatus, TransactionSource,
     };
-    use tari_transaction_components::{
-        tari_amount::MicroMinotari, transaction_components::OutputType,
+    use minotari_wallet::{
+        models::OutputStatus,
+        transactions::{BlockchainInfo, TransactionDetails, TransactionOutput},
     };
+    use tari_transaction_components::{transaction_components::OutputType, MicroMinotari};
     use tari_utilities::hex::Hex;
 
     const RECEIVED_PAYREF: &str =
@@ -560,75 +396,6 @@ mod tests {
         let incoming = history_dto(&conn, received_transaction()).unwrap();
         assert_eq!(incoming.amount, 100_000_000);
         assert!(incoming.fee.is_none());
-    }
-
-    #[test]
-    fn mined_receipt_crosses_confirmation_threshold_and_keeps_its_reference() {
-        let mut tx = received_transaction();
-        assert!(refresh_mined_status(&mut tx, 363576, 3));
-        assert_eq!(tx.blockchain.confirmations, 2);
-        assert_eq!(tx.status, TransactionDisplayStatus::Unconfirmed);
-        assert!(refresh_mined_status(&mut tx, 363577, 3));
-        assert_eq!(tx.status, TransactionDisplayStatus::Confirmed);
-        assert_eq!(
-            DisplayedTransactionDto::from(tx).payrefs,
-            vec![RECEIVED_PAYREF]
-        );
-    }
-
-    #[test]
-    fn mined_lock_stays_locked_until_its_height_and_can_change_status_only() {
-        let mut tx = received_transaction();
-        tx.lock_height = 363580;
-        assert!(refresh_mined_status(&mut tx, 363577, 3));
-        assert_eq!(tx.status, TransactionDisplayStatus::Locked);
-        assert!(!refresh_mined_status(&mut tx, 363577, 3));
-        assert!(refresh_mined_status(&mut tx, 363580, 3));
-        assert_eq!(tx.status, TransactionDisplayStatus::Confirmed);
-        tx.status = TransactionDisplayStatus::Unconfirmed;
-        assert!(refresh_mined_status(&mut tx, 363580, 3));
-        assert_eq!(tx.status, TransactionDisplayStatus::Confirmed);
-    }
-
-    #[test]
-    fn unmined_future_or_removed_entries_are_not_promoted() {
-        for status in [
-            TransactionDisplayStatus::Cancelled,
-            TransactionDisplayStatus::Rejected,
-            TransactionDisplayStatus::Reorganized,
-            TransactionDisplayStatus::Confirmed,
-        ] {
-            let mut tx = received_transaction();
-            tx.status = status;
-            assert!(!refresh_mined_status(&mut tx, 363714, 3));
-            assert_eq!(tx.status, status);
-            assert_eq!(tx.blockchain.confirmations, 0);
-        }
-        let mut tx = received_transaction();
-        tx.direction = TransactionDirection::Outgoing;
-        tx.blockchain.block_height = 0;
-        tx.status = TransactionDisplayStatus::Pending;
-        assert!(!refresh_mined_status(&mut tx, 363714, 3));
-        assert_eq!(tx.status, TransactionDisplayStatus::Pending);
-        tx.blockchain.block_height = 363715;
-        assert!(!refresh_mined_status(&mut tx, 363714, 3));
-    }
-
-    #[test]
-    fn mined_send_with_upstreams_zero_block_hash_reaches_confirmed() {
-        let mut tx = received_transaction();
-        tx.direction = TransactionDirection::Outgoing;
-        tx.status = TransactionDisplayStatus::Unconfirmed;
-        tx.blockchain.block_hash = FixedHash::zero();
-        assert!(refresh_mined_status(&mut tx, 363576, 3));
-        assert_eq!(tx.blockchain.confirmations, 2);
-        assert_eq!(tx.status, TransactionDisplayStatus::Unconfirmed);
-        assert!(refresh_mined_status(&mut tx, 363577, 3));
-        assert_eq!(tx.blockchain.confirmations, 3);
-        assert_eq!(tx.status, TransactionDisplayStatus::Confirmed);
-        // A known height is enough to count depth, but a real hash is still
-        // necessary to construct a current payment reference.
-        assert!(DisplayedTransactionDto::from(tx).payrefs.is_empty());
     }
 
     fn received_transaction() -> minotari_wallet::DisplayedTransaction {

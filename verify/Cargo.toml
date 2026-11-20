@@ -21,18 +21,18 @@ live-e2e = []
 # The library under test — its EXACT public API is what the harness exercises.
 # Path dependency (workspace member), so it can never drift from what CI builds
 # and there is no divergent dependency pin.
-rust_lib_flutter_rust_wallet = { path = ".." }
+minotari_wallet_ffi = { path = ".." }
 
 # Used by the fixture recorder to seed deterministic wallet rows (balance
 # changes + a displayed transaction) directly into the SQLite DB via the same
 # minotari db layer the library uses. Inherits the workspace's single resolved
 # version of every tari_* crate — no separate `tari_common_types` git pin.
-minotari-wallet = { package = "minotari", git = "https://github.com/tari-project/minotari-cli.git", rev = "1ab7c8c651b2937a8b05fba9d5a432cf633ae3f8" }
-tari_common = { version = "=6.2.0-pre.1" }
-tari_common_types = { version = "=6.2.0-pre.1" }
-tari_crypto = "0.24.0"
-tari_transaction_components = { version = "=6.2.0-pre.1" }
-tari_utilities = "0.10.0"
+minotari-wallet = { package = "minotari-wallet-core", git = "https://github.com/tari-project/minotari-cli.git", rev = "bca85dde36519871598d3e6fb411c9a002d9c360", default-features = false, features = ["http"] }
+tari_common = { version = "=6.3.0-pre.4" }
+tari_common_types = { version = "=6.3.0-pre.4" }
+tari_crypto = "=0.24.1"
+tari_transaction_components = { version = "=6.3.0-pre.4" }
+tari_utilities = "=0.10.0"
 
 anyhow = "1.0.100"
 chrono = "0.4.42"
@@ -40,10 +40,10 @@ chrono = "0.4.42"
 # JSON). Same version the tari_* crates resolve to.
 primitive-types = "0.12.2"
 # Same DB stack the library uses, so the recorder seeds the fixture through the
-# exact connection/pool types — and the SAME resolved `rusqlite` (0.39, bundled).
+# exact connection/pool types — and the SAME resolved `rusqlite` (0.41, bundled).
 r2d2 = "0.8.10"
-r2d2_sqlite = "0.34.0"
-rusqlite = { version = "0.39", features = ["bundled", "chrono", "uuid", "serde_json"] }
+r2d2_sqlite = "0.36.0"
+rusqlite = { version = "0.41", features = ["bundled", "chrono", "uuid", "serde_json"] }
 serde_json = "1"
 tokio = { version = "1.47.1", features = ["full"] }
 # Temp DBs for `materialize_fixture_db` and the Tier C live runner.

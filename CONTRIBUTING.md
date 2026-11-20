@@ -111,7 +111,8 @@ bridge zero-diff guard. Three tiers:
 
 - **Tier A — hermetic fixture replay** (`verify/tests/tier_a_fixture_replay.rs`):
   rebuilds a deterministic, **view-only** wallet DB into a temp dir, points the
-  global DB at it via `initialize_database`, and asserts the read APIs
+  database path at it via `set_database_path` (and `unlock_wallet` where a key path
+  is exercised), and asserts the read APIs
   (`list_wallets`, `get_address`, `get_balance`, `get_transactions`) return golden
   values, with `insta` snapshots pinning each DTO's shape + content.
 - **Tier B — recorded/replayed RPC** (`verify/tests/tier_b_recorded_rpc.rs`): a
@@ -140,6 +141,8 @@ jobs in [`.github/workflows/ci.yml`](./.github/workflows/ci.yml)):
 - `build`
 - `test`
 - `cargo-deny`
+- `forbidden crates`
+- `release scripts`
 - `bridge codegen drift`
 - `public API stability`
 
@@ -178,17 +181,15 @@ the frozen contract. Never bypass it on a dependency PR.
   producer* (it compiles to the native libs linked by the Flutter app), not a
   reusable library — so the lockfile is the reproducible-build record, not noise to
   be ignored. A reusable library would `.gitignore` it; we must not.
-- `minotari` is pinned to the **main revision `1ab7c8c651b2937a8b05fba9d5a432cf633ae3f8`**
-  (the merged scan-driven confirmation fix, #149; still reports package 0.3.0); `tari_common` / `tari_common_types` / `tari_hashing` /
-  `tari_transaction_components` are pinned exactly to `=6.2.0-pre.1`;
-  The transitive crates are held at this pre-release in `Cargo.lock` to avoid
-  resolving incompatible final releases;
+- `minotari-wallet-core` is pinned by **git rev** (with `default-features = false,
+  features = ["http"]`; the `forbidden crates` CI job fails if `Cargo.lock` gains
+  `openssl-sys`, `native-tls`, `utoipa-swagger-ui`, `axum`, `clap`, `tonic` or
+  `prost`); `tari_common` / `tari_common_types` /
+  `tari_hashing` / `tari_transaction_components` are pinned **exactly** to the
+  `=6.3.0-pre.4` pre-release the `minotari` rev builds against (a caret pin would
+  resolve to a later pre-release or final, which that rev does not compile with; the transitive
+  `tari_*` crates are held at `6.3.0-pre.4` in `Cargo.lock`);
   `flutter_rust_bridge` is pinned **exactly** `=2.11.1`.
-- Keep the transitive `tari_*` crates on the same `6.2.0-pre.1` release in
-  `Cargo.lock`. The wrapper uses `tari_crypto` 0.24 and the same SQLite
-  stack as minotari (`r2d2_sqlite` 0.34 / `rusqlite` 0.39). Mixing these
-  with the former 6.0.1-pre.2 / crypto 0.23 stack creates incompatible types. Use the committed lockfile (`--locked`) for builds and
-  tests, including native iOS/Android builds.
 
 ### FRB runtime ↔ codegen CLI lockstep
 
@@ -233,8 +234,15 @@ process is:
    (function, class/enum, field, variant) means the bump leaked a contract change —
    revert, or promote to a MAJOR only via a coordinated migration (see below).
 
-Pre-release `tari_*` (`6.2.0-pre.1`) can change shape between pre-releases — never
+Pre-release `tari_*` (`6.3.0-pre.4`) can change shape between pre-releases — never
 auto-merge a `tari_*` bump.
+
+### Refresh `webpki-roots` every release
+
+Base-node TLS trusts the CA bundle compiled in through `webpki-roots` (not the OS
+store; see `docs/THREAT_MODEL.md`). Before tagging each release, run
+`cargo update -p webpki-roots`, so removed or distrusted CAs drop out and new ones
+arrive, and commit the `Cargo.lock` change with the release.
 
 ### Dependency-update automation (Renovate)
 
@@ -275,13 +283,136 @@ is a **MAJOR** that is forbidden outside a Cake-Wallet-coordinated migration car
 the `breaking-api-approved` trail. Record every notable change in `CHANGELOG.md`
 under `[Unreleased]` in the same PR.
 
-### Native release artifacts (future)
+### Native release artifacts
 
-Per-platform native libraries (Android `.so`, iOS `.a`) are built and versioned by
-the consuming Flutter app's pipeline today; this crate publishes none itself
-(`publish = false`). If the team later needs to publish prebuilt native artifacts,
-sketch the per-target build + versioning here as a follow-up — it is not implemented
-now.
+Pushing a `v*` tag runs [`release.yml`](./.github/workflows/release.yml), which
+publishes a GitHub release Cake Wallet downloads instead of compiling Rust:
+
+| Asset | Contents |
+|---|---|
+| `cw_tari_wallet-<tag>-android.zip` | `jniLibs/{arm64-v8a,armeabi-v7a,x86_64}/libminotari_wallet_ffi.so` (NDK 28.2.13676358, API 21) |
+| `cw_tari_wallet-<tag>-ios.zip` | `minotari_wallet_ffi.xcframework`: dynamic frameworks for device arm64 and simulator arm64+x86_64 (iOS 12) |
+| `cw_tari_wallet-<tag>-macos.zip` | universal (arm64 + x86_64) `libminotari_wallet_ffi.dylib` (macOS 13) |
+| `cw_tari_wallet-<tag>-linux-x86_64.zip` | x86_64 `libminotari_wallet_ffi.so` |
+| `cw_tari_wallet-<tag>-linux-aarch64.zip` | aarch64 `libminotari_wallet_ffi.so` |
+| `cw_tari_wallet-<tag>-windows.zip` | x86_64 MSVC `minotari_wallet_ffi.dll` |
+| `cw_tari_wallet-<tag>-dart.zip` | the committed FRB Dart bindings, i.e. the repo's `.dart/` at the tagged commit, unpacked to `dart/` (`dart/api/*.dart`, `dart/frb_generated.dart`, `dart/frb_generated.io.dart`, `dart/frb_generated.web.dart`, `dart/pubspec.yaml`) |
+| `SHA256SUMS` | checksums of every zip; check the ones you downloaded with `sha256sum -c --ignore-missing SHA256SUMS` (macOS: `shasum -a 256 -c --ignore-missing SHA256SUMS`) |
+
+Every zip and `SHA256SUMS` also carries a GitHub build-provenance attestation.
+`SHA256SUMS` alone lives in the same mutable release as the zips, so check provenance
+with:
+
+```sh
+gh attestation verify <zip> --repo tari-project/cw_tari_wallet \
+  --cert-identity https://github.com/tari-project/cw_tari_wallet/.github/workflows/release.yml@refs/tags/<tag> \
+  --source-digest <commit sha> --deny-self-hosted-runners
+```
+
+(The release notes print this command with the tag and commit SHA filled in.) It
+checks that the file's digest was attested on a GitHub-hosted runner by exactly
+`.github/workflows/release.yml` of this repository, running for `refs/tags/<tag>` at
+`<commit sha>`. `--cert-identity` is an exact match. Avoid `--signer-workflow`: it
+matches as an unanchored pattern, so a look-alike workflow such as
+`release-yml-lint.yml` would pass. Without these flags, any workflow on any branch
+of this repo could produce an attestation the command accepts. The command does not
+check who pushed the tag, so the identity only means "built from the released tag"
+once the `v*` tag ruleset below restricts who can create `v*` tags. Cake Wallet should still
+pin each version's sha256 in its own repository rather than trust the release page
+at download time, and immutable releases should be on.
+
+The release notes list the tag's commit SHA, the `minotari-wallet-core` rev, the
+FRB and rustc versions, every locked `tari_*` version, and each zip's size with the change
+from the previous tag ([`scripts/release/release_notes.py`](./scripts/release/release_notes.py)).
+
+- **One network group.** Every library is built with `TARI_TARGET_NETWORK=mainnet`.
+  `tari_common` fixes the accepted networks at compile time, so the bundle accepts
+  only `MainNet` and `StageNet` (chosen at runtime). For Esmeralda, build locally
+  with `TARI_TARGET_NETWORK=testnet make release-<platform>`. The `make release-*`
+  targets default to `mainnet`; `scripts/release/build.sh` refuses anything else and
+  fails if `tari_common` did not report a MainNet build.
+- **No downloads during the build.** The job runs `cargo fetch --locked`, then builds
+  with `CARGO_NET_OFFLINE=true` and the network blocked, so an accidental download
+  (for example a build script fetching an asset) fails the release. This is
+  detection, not a security boundary: a deliberately hostile build script could get
+  around it (Linux builds keep the runner user's passwordless sudo, Windows builds
+  run as admin, and the macOS profile allows everything except remote
+  connections). Linux runners (Android, Linux x86_64/aarch64) build in a network
+  namespace with no network; macOS runners (iOS, macOS) build under `sandbox-exec`
+  with [`scripts/release/offline.sb`](./scripts/release/offline.sb), which denies
+  every connection except to localhost; the Windows runner switches the firewall to
+  default-deny outbound and restores it afterwards. While blocked, Windows allows only
+  DNS, the GitHub runner processes, and programs that already held an outbound
+  connection when the block was applied (shells and build tools excluded; the job log
+  lists them). Each job first checks that `https://index.crates.io` returns no HTTP
+  response at all and fails if it does. The tag must equal `v` + the `Cargo.toml` version,
+  and `scripts/check_forbidden_crates.sh` runs first.
+- **Least privilege.** CI and the release builds get a read-only token, and
+  checkouts never persist credentials. Each build uploads its own artifact; the
+  `assemble` job ([`scripts/release/assemble.sh`](./scripts/release/assemble.sh))
+  fails unless each holds only that platform's zip and rustc version, then writes
+  `SHA256SUMS` and the notes without a write token. Only the final `publish` job,
+  which runs on a pushed tag and in the `release` environment, can write. It checks
+  that the downloaded bundle matches the digests `assemble` recorded and every file
+  is listed in `SHA256SUMS`. It also checks that the tag still points at the built
+  commit, then attests the files and creates the release. Every action is pinned to
+  a commit SHA, and Renovate keeps those pins updated. The `check` job also runs
+  `cargo deny check advisories`, so an advisory published after the commit's CI
+  still blocks the release.
+- **Residual risks.**
+  - `assemble.sh`'s per-artifact check catches name collisions and one job
+    supplying another platform's files. It does not stop a build job that is itself
+    malicious: that job runs with sudo or admin rights and a token able to touch the
+    run's artifacts. A malicious dependency could trojan every platform anyway. The
+    digest check in `publish` only covers what happens after `assemble`.
+  - The tag re-check narrows, but does not close, the window in which a tag can be
+    moved between build and publish. The `v*` tag ruleset and immutable releases
+    close it.
+  - CI installs `flutter_rust_bridge_codegen` through `taiki-e/install-action`
+    (a binstall fallback) without a checksum, so the codegen-drift check trusts that
+    upstream binary. The worst case is stale bindings passing the check, not code
+    injected into the release.
+  - If the real publish fails with "release already exists", something else
+    created that release: treat it as compromised, delete it, and investigate before
+    re-running.
+- **Reproduce one platform locally** with `scripts/release/build.sh <platform> <tag>
+  <out-dir>` (Android needs `ANDROID_NDK_HOME`; iOS needs Xcode).
+
+To release: bump `version` in `Cargo.toml`, move the `CHANGELOG.md` entry under the
+new version and merge to `main`. Once CI is green on that `main` commit, run the
+**Release** workflow by hand (Actions → Release → Run workflow) on it: a manual run
+is always a dry run, even on a tag. It builds and packages everything as `dryrun`
+and prints the notes, but publishes nothing. Once it is green, push the tag
+`v<version>` on the same commit. Only a pushed tag publishes. The release fails
+unless the tagged commit is on `main` **and** CI's `bridge codegen drift`,
+`forbidden crates` and `cargo-deny` jobs all succeeded in `ci.yml`'s own run for
+the push of that exact commit to `main` (look-alike check runs from other workflows
+do not count)
+([`scripts/release/require_ci_green.sh`](./scripts/release/require_ci_green.sh)). The
+codegen-drift check is what guarantees the shipped Dart bindings match the Rust. If
+CI is still running or has not run on the commit, the release stops and asks you to
+wait. `main` currently has no branch protection, so being on `main` alone proves
+nothing.
+
+**Recommended repository settings.** A maintainer applies these by hand; the
+workflow cannot enforce them, and until they exist anyone who can push a `v*` tag can
+publish:
+
+- **`release` environment:** add required reviewers, and a deployment rule that
+  allows only `v*` tags. The workflow already uses this environment; GitHub creates
+  it without protection until it is configured. Reviewers only gate jobs that
+  declare the environment: another workflow merged to `main` can still ask for
+  `contents: write` or `id-token: write` itself. Pair this with the branch protection
+  below (required review) and a `CODEOWNERS` entry that sends `.github/workflows/**`
+  changes to the release maintainers.
+- **Tag ruleset for `v*`:** restrict creating, updating and deleting matching tags to
+  maintainers.
+- **Branch protection on `main`:** require the CI checks listed under
+  [Branch protection](#branch-protection).
+- **Actions → General → Workflow permissions:** default token = read, and do not let
+  GitHub Actions create or approve pull requests.
+- **Releases:** turn on immutable releases, so a published release's assets and tag
+  cannot be changed.
 
 ## Deferred / future work
 
@@ -296,17 +427,11 @@ Each of these would change the frozen contract, so none is implemented. They nee
 Cake-Wallet-coordinated migration (and the `breaking-api-approved` trail if a change
 is not purely additive).
 
-- **Surface reorg cancellations.** `ProcessingEvent::ReorgDetected` is mapped to
-  `None` in `map_processing_event`, so Dart is never told which transactions a
-  blockchain reorganization cancelled — a wallet can keep showing a transaction the
-  chain has dropped. Surfacing it means a new `ScanEventDto` variant, which is
-  additive but changes the streamed event set that Cake Wallet pattern-matches on.
-- **Type the secrets crossing the FFI.** `SendTransactionDetails.seed_words`
-  (`Vec<String>`) and `.passphrase` (`Option<String>`) cross the bridge as plain
-  values. The bridge now *moves* them into zeroizing containers on entry, so no
-  un-wiped Rust-side duplicate remains, but the buffers the FFI layer itself
-  allocates are outside our control. Fixing that fully means changing the public
-  field types.
+- **Type the secrets crossing the FFI.** Done for sends and scans in v0.2.0
+  (SPEC-10): they use the wallet's key session and take no seed words or
+  passphrase. Passphrases still cross as plain `String`s to `unlock_wallet`,
+  `change_passphrase`, `abandon_send` and the create/restore/import functions, and
+  seed words to `restore_wallet`.
 - **Honour upstream's replay binding.** `build_unsigned_transaction` mints a fresh
   random `Uuid` per attempt, discarding upstream's idempotency mechanism: two
   identical send attempts are two independent reservations rather than one

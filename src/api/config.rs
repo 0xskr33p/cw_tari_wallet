@@ -20,15 +20,20 @@ pub(crate) const DEFAULT_CONFIRMATION_WINDOW: u64 = 3;
 /// Cake-Wallet-coordinated change deliberately deferred out of this step.
 pub(crate) const DEFAULT_BASE_URL: &str = "https://rpc.tari.com";
 
-/// Default wallet passphrase (empty string). Used as the fallback when the caller passes
-/// `passphrase: None`; the empty-string semantics are part of the frozen behavior.
-pub(crate) const DEFAULT_PASSPHRASE: &str = "";
-
 /// UTXO lock duration when building a transaction, in seconds (24 hours).
 pub(crate) const SECONDS_TO_LOCK_UTXO: u64 = 60 * 60 * 24;
 
 /// Default number of outputs assumed for fee estimation.
 pub(crate) const DEFAULT_NUM_OUTPUTS: usize = 1;
+
+/// Fee per gram (µT) every send is built with. The send-all quote uses it too, so the
+/// quoted amount is exactly what the send pays out.
+pub(crate) const SEND_FEE_PER_GRAM: u64 = 5;
+
+/// Highest fee per gram (µT) a send may be built at, and the most a fee estimate
+/// reports. 20x the default rate and 10x minotari's own Fast fallback (10 µT/gram), so a
+/// bad node quote or a caller bug cannot burn more than a small multiple of a normal fee.
+pub(crate) const MAX_FEE_PER_GRAM: u64 = 100;
 
 /// Response timeout (seconds) for the `check_node_health` probe. Short so a dead
 /// node fails fast.
@@ -36,6 +41,23 @@ pub(crate) const HEALTH_TIMEOUT_SECS: u64 = 5;
 
 /// Retry attempts for the `check_node_health` probe. Low for a snappy result.
 pub(crate) const HEALTH_MAX_RETRIES: u32 = 1;
+
+/// Tokio worker threads in the FRB bridge's async runtime.
+pub(crate) const BRIDGE_ASYNC_WORKER_THREADS: usize = 2;
+
+/// Name of the FRB bridge's tokio runtime threads.
+pub(crate) const BRIDGE_ASYNC_THREAD_NAME: &str = "cw-tari-rt";
+
+/// Threads in the FRB bridge's pool for sync-in-background calls.
+pub(crate) const BRIDGE_THREAD_POOL_SIZE: usize = 2;
+
+/// Longest log message or KV value written to the log file, in bytes; longer text
+/// is cut on a char boundary and marked as truncated.
+pub(crate) const LOG_FIELD_MAX_BYTES: usize = 4096;
+
+/// Wallet events read per page when `get_abandon_warnings` (and the scan's
+/// `abandoned_then_mined_ids`) read an account's stored events.
+pub(crate) const ABANDON_EVENTS_PAGE_SIZE: i64 = 500;
 
 #[cfg(test)]
 mod tests {
@@ -58,11 +80,6 @@ mod tests {
     }
 
     #[test]
-    fn default_passphrase_is_empty() {
-        assert_eq!(DEFAULT_PASSPHRASE, "");
-    }
-
-    #[test]
     fn seconds_to_lock_utxo_is_twenty_four_hours() {
         assert_eq!(SECONDS_TO_LOCK_UTXO, 60 * 60 * 24);
         assert_eq!(SECONDS_TO_LOCK_UTXO, 86_400);
@@ -74,6 +91,16 @@ mod tests {
     }
 
     #[test]
+    fn send_fee_per_gram_is_five() {
+        assert_eq!(SEND_FEE_PER_GRAM, 5);
+    }
+
+    #[test]
+    fn max_fee_per_gram_is_one_hundred() {
+        assert_eq!(MAX_FEE_PER_GRAM, 100);
+    }
+
+    #[test]
     fn health_timeout_secs_is_five() {
         assert_eq!(HEALTH_TIMEOUT_SECS, 5);
     }
@@ -81,5 +108,15 @@ mod tests {
     #[test]
     fn health_max_retries_is_one() {
         assert_eq!(HEALTH_MAX_RETRIES, 1);
+    }
+
+    #[test]
+    fn log_field_max_bytes_is_4096() {
+        assert_eq!(LOG_FIELD_MAX_BYTES, 4096);
+    }
+
+    #[test]
+    fn abandon_events_page_size_is_500() {
+        assert_eq!(ABANDON_EVENTS_PAGE_SIZE, 500);
     }
 }

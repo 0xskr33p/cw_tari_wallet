@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to `rust_lib_flutter_rust_wallet` are documented here.
+All notable changes to `minotari_wallet_ffi` are documented here.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
@@ -37,39 +37,397 @@ diff) before the version is tagged.
 ## [Unreleased]
 
 ### Added
+- `estimate_send_fee`: quote actual recipients and memos at the selected priority
+  without reserving inputs. Existing estimate APIs remain available.
+- `send_transaction_at_fee_limit`: check the signed kernel fee against the confirmed
+  absolute maximum before broadcast; release reservations on refusal.
 
-- `get_changed_transactions(wallet_name, transaction_ids)` returns and acknowledges
-  account-local scan/send/reorg changes through the canonical history mapper.
-  Empty cycles read no history rows; failed reads retain IDs for retry. Consumers
-  must still load all history pages when opening a wallet. Existing bridge
-  declarations and streamed event shapes/order are preserved.
+### Fixed
+- Separate outgoing recipient amount and fee in send results, page reads and scan
+  events. Preserve the upstream debit/change ledger. Signed kernels supply local
+  fees; restored change memos require matching owned outputs and ledger totals.
+  Otherwise retain the known net debit with no fee. Consumers must not subtract
+  the displayed fee again.
+- Derive incoming PayRefs from received mined outputs and outgoing references from
+  recipient hashes and the actual mined block. Exclude change outputs from incoming
+  references; suppress references for unmined and rolled-back rows.
+- Include the abandoned send's required inputs in a resend quote, matching the
+  selection used to sign the replacement.
 
-### Main scanner integration (2026-10-17)
 
-- Retain scan-touched transaction IDs until the native producer completes and
-  its event channel drains. An early WAL read can see an old outgoing row or no
-  new incoming row before the write commits; re-arm those IDs for the post-scan
-  canonical read without waiting for another block. IDs coalesce per account,
-  and a database session change invalidates old scan events/replay.
-- Cake reconciles once after cancellation/scan error; normal empty cycles still
-  perform no history-row reads. Existing public scan events are unchanged.
-- Added a real SQLite + mocked-scan regression covering both early-read cases,
-  plus pure queue tests for replay, coalescing, and database-session isolation.
+## [0.4.0] — 2026-11-11
 
-- Pin minotari-cli **main** at `1ab7c8c651b2937a8b05fba9d5a432cf633ae3f8`
-  (merged #149), with Tari `6.2.0-pre.1`, tari_crypto `0.24`, and the matching
-  SQLite stack. The upstream package version remains `0.3.0`; the old tag does
-  not contain this fix.
-- Adapt finalization to `FinalizedSend`: a recorded transaction that the node has
-  not accepted remains pending and must not be reported as a retryable send error.
-- Cake consumes the upstream monitor events instead of calling the old
-  `refresh_transaction_confirmations` workaround. That bridge function remains
-  available for compatibility. Amount/fee normalization and PayRef repairs remain.
-- Added a hermetic scan regression through the real wrapper entry point: a
-  caught-up Full scan confirms a mined row, leaves an unmined send pending,
-  coalesces duplicate monitor events, and emits no history changes on the next pass.
+Additive only: existing Dart code builds and behaves as on 0.3.1.
+
+### Added (additive, SPEC-18)
+
+- `SendTransactionEvent.result` (`SendResultDto?`): the send's outcome on the
+  stream. FRB drops a streaming fn's return value, so Dart could not see it before.
+  It is set only on the final `Broadcasted` event, to exactly the value
+  `send_transaction` / `send_transaction_at_fee` resolve to: `transaction.id` (the
+  id `abandon_send` takes), `acceptedByNode`, `nodeReason` and `note`. Every other
+  event has `result == null`; the event set, order and `details` texts are
+  unchanged, and `TransactionStage` is untouched.
+- `get_abandon_warnings(walletName)` → `List<AbandonWarningDto>`: the wallet's sends
+  that were abandoned with `abandon_send` and then mined (`MinedAfterAbandon`) or
+  accepted by a node (`AcceptedAfterAbandon`) after all, one per send, ordered by
+  `eventId`. Read-only and offline (stored wallet events; no unlock needed). Errors:
+  `Database is not initialized`, `No accounts found for this wallet`,
+  `Database Error: …`.
+- `AbandonWarningDto { transactionId, kind, eventId }` and the plain enum
+  `AbandonWarningKind { acceptedAfterAbandon, minedAfterAbandon }`.
+- `TransactionsReadyDto.abandonedThenMinedIds` and
+  `TransactionsUpdatedDto.abandonedThenMinedIds` (`List<String>?`): the batch's
+  transaction ids that are abandoned sends mined after all, so a payment made again
+  may have paid twice. `null` when there are none or the lookup failed (logged; the
+  scan never fails for it). The scan's event set and order are unchanged and
+  `ScanEventDto` has no new variant.
+- `MultiSendTransactionDetails.conflictsWithTransactionId` (`String?`, last field):
+  pay again after `abandon_send` so the new send and the abandoned one can never both
+  be mined. Set it to the abandoned send's id; the send then spends every input the
+  abandon released that is still spendable (topped up as needed) and is checked before
+  signing to share at least one with the original. Works with `send_transaction` and
+  `send_transaction_at_fee`, normal sends and send-all; the stream (including
+  `result`) is unchanged. `null` sends exactly as before. New refusals, all before
+  anything is reserved except the last: `Wallet Error: The transaction to conflict
+  with is not an abandoned send of this wallet`, `Wallet Error: None of the abandoned
+  send's inputs can be spent; check the wallet's transactions before paying again`
+  and `Wallet Error: The resend does not conflict with the abandoned send` (its
+  reservation is released); a malformed id gives the existing `Wallet Error: Invalid
+  transaction id`. The `abandon_send` docs now say to pay again only this way.
 
 ### Changed
+
+- Bumped `minotari-wallet-core` to minotari-cli `6743f50`. That includes
+  tari-project/minotari-cli#180, which lets a send require specific inputs and lists
+  an abandoned send's inputs, and #181, which fixes `get_output_by_id` and
+  `get_input_by_id` failing on stored timestamps. The `tari_*` crates stay at
+  `=6.3.0-pre.4`.
+
+## [0.3.1] — 2026-11-11
+
+First published release of the v0.2 API. `v0.2.0` and `v0.3.0` were tagged but never
+published; this release carries everything listed under 0.3.1, 0.3.0 and 0.2.0.
+
+### Fixed
+
+- The library builds on Windows again. A `#[cfg(unix)]` on the log file's open
+  options removed `FileRotate::new`'s last argument off Unix (E0061); Windows now
+  passes `None` (file-rotate's defaults), Unix keeps owner-only (0600) log files.
+- Release workflow: the Windows offline-build step skips agent programs the
+  firewall rejects as a rule program (the hosted runner's temp provisioner) with a
+  warning, instead of failing the job.
+
+## [0.3.0] — tagged, never published
+
+The `v0.3.0` release run failed on Windows (both fixes above), so no assets were
+published; 0.3.1 is the first release carrying these changes.
+
+### Added (additive, SPEC-20)
+- `send_transaction_at_fee(sink, details, fee_per_gram)`: `send_transaction` built at
+  the given rate (µT per gram) instead of the fixed 5. The rate is exact; the fee is
+  exactly the quote only for a send-all (a normal send's fee estimate stays an estimate).
+- `estimate_send_all_fee_at(…, fee_per_gram)`: the send-all quote at that rate.
+- `get_fee_per_gram(priority, base_url)`: the node's rate for a priority, capped,
+  floored and ordered as in fee estimates, without reading the wallet (errors `Failed to get the fee per gram` only
+  for an unusable `base_url`).
+- Both refuse a rate of 0 or above 100 µT/gram, before any UTXO is reserved, with the
+  new error `Invalid fee per gram: <rate> (must be 1 to 100 microTari per gram)`.
+
+### Changed
+
+- The crate and its native library are renamed from `rust_lib_flutter_rust_wallet`
+  to `minotari_wallet_ffi` (`libminotari_wallet_ffi.so` / `.dylib`,
+  `minotari_wallet_ffi.dll`, `minotari_wallet_ffi.xcframework`), so the library
+  names the coin it serves. The Dart API is unchanged; only the library the
+  generated loader opens (`stem`) differs, so consumers update their packaging.
+- Bumped `minotari-wallet-core` to minotari-cli `80e8ac9` (the merge of tari-project/minotari-cli#179)
+  and the `tari_*` crates to `=6.3.0-pre.4` (`tari_sidechain` 9.0). No change to
+  the bridge.
+- Fee estimates cap the node's fee per gram at 100 µT/gram before selecting inputs, so
+  an estimate's `fee_per_gram` is always a rate `send_transaction_at_fee` accepts and a
+  wallet that can pay at the cap is quoted. Medium and Fast are never below 5 µT/gram
+  (the old fixed send rate) and Slow <= Medium <= Fast, so a node quoting 0 or out of
+  order cannot make a Fast send crawl. Otherwise estimates are unchanged.
+
+### Security
+
+- Bundled SQLite is now 3.54.1: `rusqlite` 0.41 / `libsqlite3-sys` 0.39.1 (via
+  minotari-cli), with `r2d2_sqlite` 0.36 and (verify) `rusqlite` 0.41 to match.
+  Fixes [RUSTSEC-2026-0459](https://rustsec.org/advisories/RUSTSEC-2026-0459)
+  (CVE-2026-119375), which failed the `v0.2.0` release's `cargo deny` gate.
+
+## [0.2.0] — tagged, never published
+
+The `v0.2.0` release run failed `cargo deny` on RUSTSEC-2026-0459, so no assets were
+published; 0.3.0 is the first release carrying these changes.
+
+**This release intentionally breaks the v1 API** (SPEC-10, PR labelled
+`breaking-api-approved`). Cake Wallet is the only consumer and pins the tag. The
+bridge now owns the wallet session and the database lifetime, scans belong to the
+wallet that started them, and sends report what actually happened. None of this
+assumes a single Dart isolate: Cake's Android background engine runs in the same
+process and shares every Rust static.
+
+### Breaking changes from v1
+
+Database and sessions:
+
+- `initialize_database(path)` and `disconnect_database()` are no longer exported.
+  Use the new functions instead:
+  - `set_database_path(path)` (sync) records the database file without opening it
+    (errors if a pool is open on another path). Call it before
+    `create_wallet` / `restore_wallet` / `import_*` when no wallet is unlocked yet.
+  - `unlock_wallet(dbPath, walletName, passphrase)` (sync) opens the shared pool if
+    none is open (another path while wallets are unlocked errors as
+    `Database Error: Another database is open; lock its wallets first`), unlocks the
+    wallet's key session (minotari runs Argon2 once) and adds one to the wallet's
+    open count. The passphrase is always checked: for a wallet that is already
+    unlocked (e.g. by the other engine) it is verified against the stored wallet
+    (one Argon2 run) before the session is shared. A failed unlock adds no count.
+    If the wallet is force-locked, deleted or renamed while the unlock runs, the
+    lock wins and the unlock errors with `Wallet is locked`.
+    Errors: `Invalid Passphrase`, `No accounts found for this wallet`,
+    `Wallet is locked`.
+  - `lock_wallet(walletName)` (async) → `bool` takes one off the count. At zero it
+    locks the key session and stops (and waits for) that wallet's scans, and when
+    no wallet is open it closes the pool; it then returns `true`. It returns `false`
+    when other holders remain or the wallet was not unlocked, and locks nothing.
+    The foreground and background engines can both hold the same wallet open: each
+    `unlock_wallet` needs its own `lock_wallet`. A later `unlock_wallet` reopens the
+    pool.
+  - `force_lock_wallet(walletName)` (async) locks the wallet for every holder at
+    once (both engines, or a count a dead engine left behind), stops (and waits for)
+    its scans, and closes the pool when no other wallet is open. Use it on logout,
+    or when `lock_wallet` returned `false` but the wallet must be locked now.
+  - `checkpoint_database()` (sync) runs `PRAGMA wal_checkpoint(TRUNCATE)` on the
+    open pool, or a temporary one, so a copy of the database file is consistent
+    (for backups). Errors if another connection kept it from finishing.
+- Functions without a path (`list_wallets`, `get_balance`, `get_transactions`,
+  `create_wallet`, …) use the open pool, or a temporary one on the recorded path.
+  `Database is not initialized` now means no path was ever recorded.
+- `delete_wallet` and `rename_wallet` are now async. They work with or without a
+  session: the wallet is locked for every holder and its scans are stopped first,
+  no scan of it can start until the change is committed, and a session or scan the
+  other engine began meanwhile is dropped afterwards.
+  `rename_wallet(a, a)` errors as
+  `The new wallet name is the same as the current one` and changes nothing.
+
+Keys only through the session (new error string `Wallet is locked`):
+
+- `send_transaction(details: MultiSendTransactionDetails)` → `SendResultDto` replaces
+  the v1 `send_transaction(SendTransactionDetails)` → `DisplayedTransactionDto` and
+  `send_transaction_multi`, which is removed. `SendTransactionDetails` is removed.
+  `MultiSendTransactionDetails` loses `seedWords` and `passphrase`; the wallet must
+  be unlocked. The seed/account mismatch error is gone with the seed words.
+- `sign_message(walletName, message)` uses the session. It replaces the v1
+  `sign_message(message, seedWords)` and `sign_message_with_wallet`, which are
+  removed.
+- `get_address(walletName, network?)` loses its `passphrase` parameter and needs an
+  unlocked wallet.
+- `get_seed_words(walletName, passphrase)` gains `walletName` (it used to read the
+  first account). With `reveal_seed_words` it stays the only way to read the
+  mnemonic.
+- `abandon_send` and `change_passphrase` check the passphrase even while the wallet
+  is unlocked. `change_passphrase` keeps an unlocked wallet unlocked. If the
+  wallet's name is renamed, deleted or re-created between the passphrase check and
+  the abandon, `abandon_send` abandons nothing and errors with
+  `Wallet Error: The wallet was renamed or replaced; try again`.
+- `restore_wallet` is now the only exported function that takes seed words.
+
+Per-wallet scan handles:
+
+- New `create_scan_handle(walletName)` (sync) → `ScanHandle { walletName, id }`.
+  `start_scan(handle, config)` and `rescan(handle, fromHeight, config)` stream
+  `ScanEventDto`; `stop_scan(handle)` stops only that scan, and does nothing for a
+  handle whose scan already finished or was superseded (it stops a scan that has
+  not started yet before it runs). The global `stop_scan()` is removed. A handle
+  starts one scan (`Wallet Error: This scan handle was already used`) for its own
+  wallet (`Wallet Error: The scan handle belongs to another wallet`).
+- Scans need an unlocked wallet. `ScanConfiguration` loses `passphrase` and gains
+  `priority: ScanPriority` (`foreground` | `background`), `processingThreads`,
+  `eventBuffer`, `deadlineSeconds` and `maxBlocks` (`null` keeps minotari's default;
+  `processingThreads` is clamped to between 1 and the device's available
+  parallelism; `maxBlocks` applies to one-shot scans only).
+- A key path (address, signing, send, scan) whose wallet is locked while it runs
+  fails with `Wallet is locked`, never with a decryption error.
+- Scans of different wallets run at the same time. A second start for the same
+  wallet replaces the first, whose stream ends with `superseded`, except that a
+  Background start during a running Foreground scan is refused with
+  `A foreground scan of this wallet is already running` (the Foreground scan keeps
+  running). A Foreground start over a Background scan waits for it to stop.
+  `abandon_send` / `change_passphrase` on one wallet no longer stop other wallets'
+  scans.
+- Only the v2 event shape remains, under the plain names: `start_scan_v2`,
+  `rescan_v2` and `ScanEventV2Dto` are removed, and the v1 `ScanEventDto` (with
+  `ScanStatusDto`) is replaced by the flat former-v2 shape. `paused` is removed
+  (minotari no longer reports it) and minotari no longer sends `started`.
+- Every scan stream ends with exactly one terminal event: `completed` (a one-shot
+  scan reached the tip), `cancelled`, `superseded`, `budgetExhausted { accountId,
+  lastScannedHeight, tipHeight }` or `error`. A stopped scan no longer just ends
+  with no event.
+
+Send stages:
+
+- `TransactionStage.completed` is renamed `broadcasted`: it means the send was
+  recorded and handed to the node. Confirmation is reported by the scanner
+  (`transactionsUpdated`), not by the send stream.
+- The reserved, never-emitted `TransactionStage.fetchingBalance` is removed.
+- The `signingKeyGeneration` event's `details` text is now `Loading signing keys...`.
+
+### Changed
+
+- Switched the dependency from `minotari` to `minotari-wallet-core` at minotari-cli
+  `509e6b3` (SPEC-05 crate split, SPEC-06 key sessions, SPEC-07 scan resource
+  controls and terminal events) with `default-features = false, features = ["http"]`.
+  The `tari_*` crates were already at `=6.3.0-pre.1` (`tari_crypto` 0.24,
+  `tari_utilities` 0.10), which is what that rev uses, so they are unchanged.
+  `tari_crypto` and `tari_utilities` are now exact pins too (`=0.24.1`, `=0.10.0`,
+  the versions already in `Cargo.lock`), so every `tari_*` requirement is `=`.
+  `Cargo.lock` no longer contains `openssl-sys`, `native-tls`, `utoipa-swagger-ui`,
+  `axum`, `clap`, `tonic` or `prost`; the new `forbidden crates` CI job keeps it
+  that way, and CI no longer installs `protoc`. Base-node HTTPS now trusts the
+  Mozilla CA bundle compiled in through `webpki-roots`, not the operating system's
+  certificate store. `deny.toml`: crate-scoped
+  `CDLA-Permissive-2.0` exception for `webpki-roots`; RUSTSEC-2024-0449 pruned.
+- The expired-reservation sweep and the rescan rollback, which stayed in the
+  `minotari` CLI crate, are rebuilt in the bridge from `minotari-wallet-core` pieces
+  with the same behaviour.
+
+### Release bundle (SPEC-12)
+
+- Pushing a `v*` tag now publishes prebuilt libraries for Android, iOS
+  (dynamic xcframework), macOS (universal dylib), Linux x86_64 and aarch64, and
+  Windows x86_64,
+  plus the FRB Dart bindings and `SHA256SUMS`
+  ([`release.yml`](./.github/workflows/release.yml)). The release notes record
+  the commit SHA, `minotari-wallet-core` rev, FRB, rustc and `tari_*` versions, and each
+  artifact's size and change from the previous tag.
+- Release libraries are built after `cargo fetch --locked` with the network
+  blocked on every runner (Linux network namespace, macOS `sandbox-exec`, Windows
+  firewall), so an accidental download fails the build. This is detection, not a
+  security boundary against a hostile build script.
+- Release zips and `SHA256SUMS` carry GitHub build-provenance attestations
+  (`gh attestation verify <zip> --repo tari-project/cw_tari_wallet --cert-identity
+  https://github.com/tari-project/cw_tari_wallet/.github/workflows/release.yml@refs/tags/<tag>
+  --source-digest <commit sha> --deny-self-hosted-runners`; see CONTRIBUTING.md for
+  what this proves). Publishing
+  runs in a separate tag-only job in the `release` environment, and it is the only
+  job with a write token. CI now has a read-only token, checkouts never persist
+  credentials, and every action is pinned to a commit SHA.
+- **The bundle is a mainnet-group build** (`TARI_TARGET_NETWORK=mainnet`): it
+  accepts only `MainNet` and `StageNet`. Esmeralda needs a local build with
+  `TARI_TARGET_NETWORK=testnet`.
+- New `make release-macos` / `release-linux` / `release-windows` targets; every
+  `release-*` target now builds with `--locked` and defaults
+  `TARI_TARGET_NETWORK` to `mainnet`.
+- The iOS framework no longer links the system SQLite (`-lsqlite3`): the library
+  already carries its own SQLite (`rusqlite` `bundled`), so the extra
+  `/usr/lib/libsqlite3.dylib` load command was unused. The framework also no
+  longer exports that bundled SQLite's `sqlite3*` symbols, so a by-name lookup
+  for the app's own SQLite (for example `DynamicLibrary.process()`) cannot
+  resolve to it. The FRB/Dart symbols are still exported.
+
+### Added earlier in this release (SPEC-06)
+
+Additive at the time; several of these were renamed or removed by the breaking
+changes above.
+
+- `sign_message_with_wallet(walletName, passphrase, message)` — signs with the
+  stored wallet's spend key, so Dart no longer needs the seed words. Errors:
+  `Signing Error: View-only wallets cannot sign messages`, `Invalid Passphrase`,
+  `No accounts found for this wallet`.
+- `send_transaction_multi(details: MultiSendTransactionDetails)` (stream of
+  `SendTransactionEvent`) with new `MultiSendTransactionDetails` and
+  `SendRecipient { address, amount, paymentId? }`: several recipients in one
+  transaction, or `sendAll: true` (exactly one recipient) to sweep the wallet.
+  Resolves to the new `SendResultDto { transaction, acceptedByNode, note?,
+  nodeReason? }`: when `acceptedByNode` is `false` the send is recorded and
+  rebroadcast by the wallet, so show `note` and never resend. `nodeReason` is the
+  node's text with invisible characters (bidi overrides, zero-width, line
+  separators, fillers, variation selectors) removed; the same cleaning applies to
+  node text in `get_height_at_time` and send-broadcast `Network Error`s and in the
+  scans' terminal `error` event and returned error (which keeps its "Caused by"
+  chain).
+  Empty `seedWords` signs with the stored wallet's keys (wrong passphrase →
+  `Invalid Passphrase`; view-only wallet → `Signing Error: View-only wallets
+  cannot send`, before anything is locked); that is how a key-imported wallet sends.
+  `send_transaction` is unchanged and now runs through the same path.
+- `abandon_send(walletName, passphrase, transactionId)` (async) → `String` (what
+  abandoning does not do): the recovery path for a send the node never takes. Keep
+  scanning so the wallet rebroadcasts it; once the node has refused it until it
+  stalls, `abandon_send` gives it up and releases its inputs, via minotari. There
+  is no force option: a send reset by a rescan or reorg can look unmined, and a
+  mined send never stalls. Any running scan is stopped first so its rebroadcast
+  cannot race the abandon, and a scan started meanwhile waits until it is done;
+  start it again afterwards. The original can still be mined if a node holds it:
+  right after an abandon, `Rejected` means "not known to be mined", not "will not
+  be mined", so do not treat it as proof until later scans from a trusted node. If
+  paying again, prefer a send that spends the same inputs (minotari's largest-first
+  selection usually picks the released inputs again, so a same-amount resend
+  normally conflicts with the original rather than paying twice). Errors: `Invalid Passphrase`, `No accounts found for this wallet`,
+  `Wallet Error: Invalid transaction id`, `Wallet Error: The send has not stalled
+  yet; keep scanning so the wallet rebroadcasts it`, `Wallet Error: …` (unknown
+  send, already mined, input spent, change in use or on chain, no change output).
+- `estimate_transaction_fee_for_outputs(amount, numOutputs, priority, baseUrl, walletName)`
+  → `FeeEstimate`.
+- `estimate_send_all_fee(walletName, recipientAddress, paymentId?, network?, confirmationWindow?)` →
+  new `SendAllFeeEstimate { fee, amountAfterFee, inputCount, skippedDust, skippedOverCap }`.
+- `change_passphrase(walletName, oldPassphrase, newPassphrase)` (async): checks
+  the old passphrase first (`Invalid Passphrase`, leaving a running scan alone;
+  unknown wallet → `No accounts found for this wallet`), then stops any running
+  scan and keeps new scans waiting until the rewrite is done.
+- `import_wallet_from_keys(walletName, viewPrivateKeyHex, spendPrivateKeyHex, birthday, passphrase, network?)`
+  → `WalletCreationDetails` (spendable through `send_transaction_multi` with empty
+  `seedWords`; `seedWords` in the result is `null`).
+- `rescan(fromHeight, config: ScanConfiguration)` → `Stream<ScanEventDto>`: stops
+  any running scan, rolls the wallet back to `fromHeight` (minotari), then scans as
+  `start_scan` does. A wrong passphrase errors as `Invalid Passphrase` (also
+  streamed as the terminal `error` event).
+- New `height` module: `get_height_at_time(baseUrl, epochSecs, network?)` (async;
+  on MainNet, including `network: None`, refuses a node height more than two days
+  of blocks above the offline estimate as
+  `Network Error: Node reported an implausible height …`; the estimate runs high,
+  about 17 days of blocks by September 2026, so a hostile node can still push a
+  start that far plus two days late; other networks get the node's answer
+  unchecked, as their block times swing and their coins have no value),
+  `estimate_height_at_time(network?, epochSecs)`, `birthday_from_height(network?, height)`
+  and `birthday_from_date(epochSecs)` (all three sync, offline).
+- `current_network()` (sync) → `TariNetwork?`: the network this process is locked to.
+- `start_scan_v2(config)` and `rescan_v2(fromHeight, config)` →
+  `Stream<ScanEventV2Dto>`, a new flat event type: `started`, `progress` (with
+  `tipHeight`), `completed`, `paused`, `waiting` (caught up, polling),
+  `moreBlocksAvailable`, `transactionsReady`, `transactionsUpdated`,
+  `reorgDetected(ReorgDetectedDto)` and `error`. New `ReorgDetectedDto { accountId,
+  reorgFromHeight, newHeight, blocksRolledBack, cancelledTransactionIds,
+  reorganizedTransactions }`. The v1 `start_scan`/`rescan` streams are unchanged:
+  both are fed from the same internal stream, with reorgs and the tip dropped.
+
+### Changed
+
+- Upstream's offline-signing payload summary (recipients, amounts, memos, fee,
+  change), logged on every send under `c::tx::offline_signing`, is capped at Warn
+  by default and in any `LoggerConfig` that does not set that target itself.
+
+- `stop_scan` now returns only once the running scan has actually stopped (Dart
+  signature unchanged: `Future<void> stopScan()`).
+- Message signing and verification are delegated to `minotari::signing`;
+  `src/domain/signing.rs` is removed. Signature format, domain tag and error
+  strings are unchanged.
+- Bumped the `minotari-cli` git pin from `1ab7c8c` to `86503ff` (0.6.0: send-all,
+  multiple recipients, passphrase change, key restore, rescan, height-by-date, scan
+  progress with tip and reorg events) and the `tari_*` crates from `=6.2.0-pre.1`
+  to `=6.3.0-pre.1` (still exact pins). minotari now uses `utoipa-swagger-ui` 10
+  (zip 9), so the three zip advisory ignores were pruned from `deny.toml`; `rand`
+  was bumped within range to 0.8.6 / 0.9.3.
+  **Behaviour change Cake Wallet must sign off** (introduced by the `1ab7c8c` bump
+  below, still true): `send_transaction` resolves `Ok` for a send the node does not
+  accept on first broadcast (or cannot be reached for), instead of failing with
+  `Network Error: …`. The send is recorded
+  and rebroadcast by the wallet; resending it would pay twice. The frozen return
+  type cannot say so (the note is only logged); use `send_transaction_multi`,
+  whose `SendResultDto.acceptedByNode` reports it. The scan's new tip height and reorg
+  events reach Dart only through the v2 scan streams.
 
 - Bumped the `minotari-cli` git pin from `af78477` to `1ab7c8c` (tip of `main`,
   minotari 0.3.x) and the `tari_*` crates from `5.7.0-pre.8` to `=6.2.0-pre.1`, in

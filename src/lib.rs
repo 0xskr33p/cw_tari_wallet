@@ -4,6 +4,9 @@
 // header does not cover them. Kept at `warn` (not `deny`) per the tooling plan;
 // `-D warnings` in CI turns these into hard failures for our code only.
 #![warn(clippy::all)]
+// The minotari scan futures are deep enough that proving the FRB scan tasks `Send`
+// exceeds the default limit of 128.
+#![recursion_limit = "256"]
 
 #[warn(
     clippy::unwrap_used,
@@ -22,6 +25,7 @@ mod frb_generated;
 
 #[flutter_rust_bridge::frb(init)]
 pub fn init_app() {
-    // Default utilities - Do not remove, needed for the rust <=> flutter bridge to function
-    flutter_rust_bridge::setup_default_user_utils();
+    // Outside `crate::api`, so FRB never invokes this; panics get a backtrace only
+    // through `init_logger`'s panic hook.
+    flutter_rust_bridge::PanicBacktrace::setup();
 }

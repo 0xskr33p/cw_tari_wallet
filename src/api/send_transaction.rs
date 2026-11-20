@@ -1,130 +1,461 @@
-use crate::api::config::{DEFAULT_BASE_URL, DEFAULT_PASSPHRASE, SECONDS_TO_LOCK_UTXO};
-use crate::api::db::{get_db_connection, get_db_pool, release_expired_reservations};
+use crate::api::config::{
+    ABANDON_EVENTS_PAGE_SIZE, DEFAULT_BASE_URL, DEFAULT_CONFIRMATION_WINDOW, MAX_FEE_PER_GRAM,
+    SECONDS_TO_LOCK_UTXO, SEND_FEE_PER_GRAM,
+};
+use crate::api::db::{
+    blocking, get_db_connection, get_db_pool, is_unlocked, release_expired_reservations,
+    session_gone, unlocked_account, with_session,
+};
 use crate::api::error::WalletError;
 use crate::api::network::{apply_network, parse_network, TariNetwork};
+use crate::api::scanner::{begin_maintenance, stop_wallet_scans};
 use crate::api::transactions::DisplayedTransactionDto;
-use crate::domain::history::{kernel_fee, normalize_local_send};
-use crate::domain::keys::key_manager_from_seed_words;
-use crate::domain::validation::{validate_send_inputs, ValidatedInputs};
+use crate::domain::abandon;
+use crate::domain::text::strip_format_chars;
+use crate::domain::validation::{
+    validate_fee_per_gram, validate_recipient, validate_recipient_count,
+};
 use crate::frb_generated::StreamSink;
 use anyhow::Result;
 use flutter_rust_bridge::frb;
-use minotari_wallet::db::expire_and_unlock_pending_transaction;
+use minotari_wallet::db::{
+    expire_and_unlock_pending_transaction, fetch_unspent_outputs, get_events_by_account_id,
+    get_latest_scanned_tip_block_by_account, get_output_by_id, WalletDbError,
+};
 use minotari_wallet::get_accounts;
-use minotari_wallet::transactions::manager::TransactionSender;
+use minotari_wallet::models::WalletEventType;
+use minotari_wallet::transactions::abandon::{
+    abandoned_send_inputs, AbandonSendError, AbandonedSendInputsError,
+};
+use minotari_wallet::transactions::manager::{FinalizedSend, TransactionSender};
 use minotari_wallet::transactions::one_sided_transaction::Recipient;
 use tari_common::configuration::Network;
-use tari_common_types::tari_address::TariAddress;
+use tari_common_types::transaction::TxId;
 use tari_transaction_components::consensus::ConsensusConstantsBuilder;
-use tari_transaction_components::key_manager::{KeyManager, TransactionKeyManagerInterface};
+use tari_transaction_components::key_manager::wallet_types::WalletType;
+use tari_transaction_components::key_manager::KeyManager;
 use tari_transaction_components::offline_signing::models::PrepareOneSidedTransactionForSigningResult;
-use tari_transaction_components::offline_signing::sign_locked_transaction;
+use tari_transaction_components::offline_signing::{
+    present_payload_summary, sign_locked_transaction, ConfirmationMode, ConfirmedPayload,
+    PayloadSummary,
+};
 use tari_transaction_components::transaction_builder::TransactionBuilderError;
 use tari_transaction_components::MicroMinotari;
 use zeroize::Zeroizing;
 
+/// One payee of a [`send_transaction`].
+///
+/// `address` is the recipient's base58 Tari address; `amount` is in **microTari**
+/// (ignored for a send-all); `payment_id` is an optional memo for this recipient.
+#[frb]
+pub struct SendRecipient {
+    pub address: String,
+    pub amount: u64,
+    pub payment_id: Option<String>,
+}
+
 /// Inputs to [`send_transaction`].
 ///
-/// `seed_words` (**secret**) and `passphrase` (**secret**) authorize spending.
-/// `network` selects the Tari network (`None` → MainNet); `base_url` is the base
-/// node RPC endpoint (`None` → the default mainnet RPC); `wallet_name` selects the
-/// account; `recipient_address` is the recipient's base58 Tari address; `amount`
-/// is in **microTari** (µT, 1e-6 XTM); `payment_id` is an optional tag;
-/// `confirmation_window` is the required confirmations in blocks (`None` → 3).
+/// `wallet_name` selects the account, which signs with its unlocked key session
+/// (`unlock_wallet`); a locked wallet errors as `Wallet is locked` and a view-only
+/// wallet as `Signing Error: View-only wallets cannot send`. `network` selects the
+/// Tari network (`None` → MainNet); `base_url` is the base node RPC endpoint (`None` →
+/// the default mainnet RPC); every entry of `recipients` gets one output, amounts in
+/// **microTari**; `confirmation_window` is the required confirmations in blocks
+/// (`None` → 3). With `send_all` set, `recipients` must hold exactly one entry and it
+/// receives every spendable output less the fee; quote that first with
+/// [`estimate_send_all_fee`](crate::api::fee::estimate_send_all_fee).
+///
+/// `conflicts_with_transaction_id` is for paying again after [`abandon_send`]: set it
+/// to the abandoned send's id (the `transaction_id` given to `abandon_send`), and pay
+/// the payee again **only** this way. The send then spends every input the abandoned
+/// send released that is still spendable (topped up from other outputs as needed), so
+/// it and the original can never both be mined: whichever is mined first invalidates
+/// the other, and the scan reports the loser as rejected. It is refused, before any
+/// UTXO is reserved, with `Wallet Error: Invalid transaction id` (not a number),
+/// `Wallet Error: The transaction to conflict with is not an abandoned send of this
+/// wallet` (unknown, another wallet's, not abandoned, or abandoned and since mined) or
+/// `Wallet Error: None of the abandoned send's inputs can be spent; check the wallet's
+/// transactions before paying again` (each was spent elsewhere, so the original can no
+/// longer be mined, or is held by another pending send), or `Wallet Error: …` with
+/// minotari's reason if the abandoned send's stored transaction cannot be read; and,
+/// as a final check before signing, with `Wallet Error: The resend does not conflict
+/// with the abandoned send` (its reservation is released). `None` sends exactly as
+/// before.
 #[frb]
-pub struct SendTransactionDetails {
-    pub seed_words: Vec<String>,
-    pub passphrase: Option<String>,
+pub struct MultiSendTransactionDetails {
     pub network: Option<TariNetwork>,
     pub base_url: Option<String>,
     pub wallet_name: String,
-    pub recipient_address: String,
-    pub amount: u64,
-    pub payment_id: Option<String>,
+    pub recipients: Vec<SendRecipient>,
+    pub send_all: bool,
     pub confirmation_window: Option<u64>,
+    pub conflicts_with_transaction_id: Option<String>,
+}
+
+/// Validated, typed inputs for building a transaction.
+struct ValidatedInputs {
+    network: Network,
+    recipients: Vec<Recipient>,
+    confirmations: u64,
+    /// The abandoned send the new one must conflict with, if any.
+    conflicts_with: Option<TxId>,
+}
+
+/// The Dart-visible reason a resend is refused because its
+/// `conflicts_with_transaction_id` is not an abandoned send of the wallet.
+const NOT_AN_ABANDONED_SEND: &str =
+    "The transaction to conflict with is not an abandoned send of this wallet";
+
+/// The Dart-visible reason a resend is refused because none of the abandoned send's
+/// inputs can be spent now.
+const NO_SPENDABLE_RELEASED_INPUT: &str =
+    "None of the abandoned send's inputs can be spent; check the wallet's transactions before paying again";
+
+/// The Dart-visible reason a resend is refused because the built transaction shares
+/// no input with the abandoned send.
+const RESEND_DOES_NOT_CONFLICT: &str = "The resend does not conflict with the abandoned send";
+
+/// What a resend needs to conflict with an abandoned send.
+struct Conflict {
+    /// The `outputs` row ids it must spend: the released inputs still spendable.
+    required_inputs: Vec<i64>,
+    /// The output hashes of every input of the abandoned send this wallet knows.
+    original_inputs: Vec<Vec<u8>>,
+}
+
+/// Parse a `DisplayedTransactionDto.id`.
+fn parse_transaction_id(transaction_id: &str) -> Result<TxId, WalletError> {
+    transaction_id
+        .parse::<u64>()
+        .map(TxId::from)
+        .map_err(|_| WalletError::wallet("Invalid transaction id"))
 }
 
 /// The lifecycle stage of an in-flight send, carried on each
-/// [`SendTransactionEvent`]. Emitted in order from `Initializing` to `Completed`.
+/// [`SendTransactionEvent`]. Emitted in order from `Initializing` to `Broadcasted`.
+///
+/// `Broadcasted` means the send is recorded and was handed to the node, not that it
+/// is confirmed: confirmation is reported by the scanner (`TransactionsUpdated`), not
+/// by the send stream.
 #[frb]
 #[derive(Clone, Debug)]
 pub enum TransactionStage {
     Initializing,
     ValidatingInput,
     ConnectingToNetwork,
-    // Reserved, frozen-contract variant: currently NOT emitted by the send flow
-    // (it goes ConnectingToNetwork -> ConstructingTransaction). Kept because removing
-    // it would break the Dart enum; do not rely on receiving it.
-    FetchingBalance,
     ConstructingTransaction,
     SigningKeyGeneration,
     SigningTransaction,
     Broadcasting,
-    Completed,
+    Broadcasted,
 }
 
 /// A progress event streamed during [`send_transaction`]: the current
 /// [`TransactionStage`] plus a human-readable `details` message.
+///
+/// `result` is the send's outcome, the same [`SendResultDto`] the call resolves to
+/// (FRB does not deliver a streaming fn's return value to Dart, so this is how Dart
+/// learns it). It is set only on the final `Broadcasted` event and `None` on every
+/// other stage. Read `result.transaction.id` (the id [`abandon_send`] takes),
+/// `result.accepted_by_node`, `result.node_reason` and `result.note` from it; when
+/// `accepted_by_node` is `false` the send is recorded and rebroadcast, so **do not
+/// send it again**. A send that fails before `Broadcasted` emits no `result` and
+/// resolves to the error instead.
 #[frb]
 #[derive(Clone)]
 pub struct SendTransactionEvent {
     pub stage: TransactionStage,
     pub details: String,
+    pub result: Option<SendResultDto>,
 }
 
-#[frb(ignore)]
-pub async fn send_transaction_with_handler<F>(
-    details: SendTransactionDetails,
-    status_callback: F,
-) -> Result<DisplayedTransactionDto>
-where
-    F: Fn(SendTransactionEvent) + Send + Sync + 'static,
-{
-    send_transaction_with_fee_handler(details, None, status_callback).await
+/// The outcome of a [`send_transaction`], delivered to Dart as the `result` of the
+/// final `Broadcasted` [`SendTransactionEvent`].
+///
+/// `transaction` is the recorded send, pending until the scan sees it mined.
+/// `accepted_by_node` is whether the node took the first broadcast (or already had
+/// it mined). When `false` the send is still recorded and the wallet rebroadcasts it:
+/// **do not send it again**. `note` is the message to show the user in that case (or
+/// when the wallet could not record everything yet); `node_reason` is the node's
+/// answer when it did not accept the send (node-supplied text: display it as plain
+/// text). Keep scanning so the wallet rebroadcasts it; if the node keeps refusing it
+/// until it stalls, [`abandon_send`] gives it up and releases its inputs; see there
+/// before paying the same payee again.
+#[frb]
+#[derive(Debug, Clone)]
+pub struct SendResultDto {
+    pub transaction: DisplayedTransactionDto,
+    pub accepted_by_node: bool,
+    pub note: Option<String>,
+    pub node_reason: Option<String>,
 }
 
-/// Internal runner shared by the frozen send API and the explicit fee API.
-#[frb(ignore)]
-pub async fn send_transaction_with_fee_handler<F>(
-    mut details: SendTransactionDetails,
-    fee_limits: Option<(u64, u64)>,
-    status_callback: F,
-) -> Result<DisplayedTransactionDto>
-where
-    F: Fn(SendTransactionEvent) + Send + Sync + 'static,
-{
-    // Move the two secrets *out* of the caller-owned `details` and into zeroizing
-    // containers before anything else runs (Shared Contracts §3). These are moves,
-    // not clones, so the original heap buffers are the ones that get wiped when
-    // these drop — on every return path, including the `?` early exits below.
-    // `SendTransactionDetails`' public field *types* are unchanged, so this is not a
-    // contract change. What remains outside our control is whatever copy the FFI
-    // layer itself holds; see the proposal in CONTRIBUTING.md.
-    let seed_words = Zeroizing::new(std::mem::take(&mut details.seed_words));
-    let passphrase = Zeroizing::new(
-        details
-            .passphrase
-            .take()
-            .unwrap_or_else(|| DEFAULT_PASSPHRASE.to_string()),
-    );
-
-    if let Some((rate, maximum)) = fee_limits {
-        minotari_wallet::transactions::fund_locker::validate_fee_per_gram(MicroMinotari(rate))?;
-        if maximum == 0 {
-            anyhow::bail!("Maximum transaction fee must be greater than zero");
+impl From<FinalizedSend> for SendResultDto {
+    fn from(sent: FinalizedSend) -> Self {
+        Self {
+            transaction: sent.displayed_transaction.into(),
+            accepted_by_node: sent.accepted_by_node,
+            note: sent.note,
+            node_reason: sent.node_reason.map(|r| strip_format_chars(&r)),
         }
     }
+}
 
+/// The Dart-visible reason an `abandon_send` of a send that has not stalled is refused.
+const NOT_STALLED: &str =
+    "The send has not stalled yet; keep scanning so the wallet rebroadcasts it";
+
+/// Give up a stalled send and release its inputs.
+///
+/// `transaction_id` is the send's `DisplayedTransactionDto.id` (for a send made with
+/// [`send_transaction`]: `result.transaction.id` of its `Broadcasted` event); `passphrase`
+/// (**secret**) must open wallet `wallet_name`. Delegates to minotari, which only
+/// abandons a send that is not mined and has stalled: the node refused its last
+/// rebroadcasts in a row (rebroadcasts happen while a scan runs, so keep scanning
+/// first). A mined send never stalls. A send without a change output is always
+/// refused. Returns what abandoning does not do.
+///
+/// The wallet's running scan is stopped (and waited for) first, and a scan started
+/// meanwhile waits until the abandon is done, so no rebroadcast races it; start the
+/// scan again afterwards. Other wallets' scans keep running.
+///
+/// The original can still be mined if a node holds it. Right after an abandon,
+/// `Rejected` means "not known to be mined", not "will not be mined": do not treat it
+/// as proof until later scans from a trusted node still show it rejected. Pay the
+/// payee again **only** with a send whose
+/// [`MultiSendTransactionDetails::conflicts_with_transaction_id`] is this
+/// `transaction_id`: that send spends the released inputs, so it and the original can
+/// never both be mined. Whichever is mined first invalidates the other, and the scan
+/// reports the loser as rejected. A send without it selects inputs on its own and can
+/// pay twice. If the original is accepted or mined after all,
+/// [`get_abandon_warnings`] reports it (and the scan event that carries it lists it in
+/// `abandoned_then_mined_ids`): check it after each scan event and at startup, and
+/// warn the user that a payment made again may have paid twice.
+///
+/// Errors: `Invalid Passphrase`, `No accounts found for this wallet`,
+/// `Wallet Error: Invalid transaction id`, `Wallet Error: The send has not stalled
+/// yet; keep scanning so the wallet rebroadcasts it`, `Wallet Error: The wallet was
+/// renamed or replaced; try again` (the name changed hands before the abandon
+/// started; nothing is abandoned), and `Wallet Error: …` with
+/// minotari's reason (unknown send, already mined, input already spent, change in use
+/// or already seen on chain, no change output).
+#[frb]
+pub async fn abandon_send(
+    wallet_name: String,
+    passphrase: String,
+    transaction_id: String,
+) -> Result<String> {
+    let passphrase = Zeroizing::new(passphrase);
+    let tx_id = parse_transaction_id(&transaction_id)?;
+
+    // Check the passphrase (Argon2, off the runtime) before touching a running scan.
+    let conn = get_db_connection()?;
+    let name = wallet_name.clone();
+    let account_id = blocking(move || {
+        let accounts = get_accounts(&conn, Some(&name))?;
+        let account = accounts.first().ok_or(WalletError::NoAccounts)?;
+        account
+            .verify_passphrase(&passphrase)
+            .map_err(|e| match e {
+                WalletDbError::DecryptionFailed(_) => WalletError::InvalidPassphrase,
+                other => WalletError::wallet(other.to_string()),
+            })?;
+        Ok(account.id)
+    })
+    .await?;
+
+    // Rebroadcasts only happen inside a scan; stop it, and keep new scans out, so
+    // none races the abandon.
+    let _maintenance = begin_maintenance(&wallet_name).await?;
+    // The name may have been renamed, deleted or re-created before maintenance began.
+    same_account(&*get_db_connection()?, &wallet_name, account_id)?;
+    stop_wallet_scans(&wallet_name).await?;
+
+    let mut conn = get_db_connection()?;
+    // Never `force` (a send reset by a rescan or reorg can look unmined) and never
+    // accept a send without a change output. A write transaction: off the runtime.
+    let abandoned = blocking(move || {
+        minotari_wallet::transactions::abandon::abandon_send(
+            &mut conn, account_id, tx_id, false, false, None,
+        )
+        .map_err(|e| match e {
+            // Upstream's text suggests a `force` flag this API does not offer.
+            AbandonSendError::NotStalled { .. } => WalletError::wallet(NOT_STALLED).into(),
+            other => WalletError::wallet(other.to_string()).into(),
+        })
+    })
+    .await?;
+    Ok(abandoned.note().to_string())
+}
+
+/// What happened to a send after the user abandoned it, in an [`AbandonWarningDto`].
+///
+/// `MinedAfterAbandon`: the send was mined after all, so a payment made again after
+/// the abandon may have paid the payee twice. `AcceptedAfterAbandon`: a node accepted
+/// a rebroadcast of it after the abandon (it may still be mined).
+#[frb]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbandonWarningKind {
+    AcceptedAfterAbandon,
+    MinedAfterAbandon,
+}
+
+impl From<abandon::WarningKind> for AbandonWarningKind {
+    fn from(kind: abandon::WarningKind) -> Self {
+        match kind {
+            abandon::WarningKind::AcceptedAfterAbandon => Self::AcceptedAfterAbandon,
+            abandon::WarningKind::MinedAfterAbandon => Self::MinedAfterAbandon,
+        }
+    }
+}
+
+/// A send the user abandoned ([`abandon_send`]) that a node accepted or that was
+/// mined after all, from [`get_abandon_warnings`].
+///
+/// `transaction_id` is the send's `DisplayedTransactionDto.id`; `event_id` is the id
+/// of the wallet event that raised the warning (increasing over time, so an app can
+/// remember the highest one it has shown).
+#[frb]
+#[derive(Debug, Clone)]
+pub struct AbandonWarningDto {
+    pub transaction_id: String,
+    pub kind: AbandonWarningKind,
+    pub event_id: i64,
+}
+
+impl From<abandon::AbandonWarning> for AbandonWarningDto {
+    fn from(w: abandon::AbandonWarning) -> Self {
+        Self {
+            transaction_id: w.tx_id.to_string(),
+            kind: w.kind.into(),
+            event_id: w.event_id,
+        }
+    }
+}
+
+/// The sends of `wallet_name` that were accepted by a node or mined after the user
+/// abandoned them, one entry per send, ordered by `event_id`.
+///
+/// Read-only and offline: reads the wallet's stored events, so it needs a database
+/// path (`set_database_path` or `unlock_wallet`) but not an unlocked wallet, and it
+/// also sees what another process scanning the same database recorded. Call it at
+/// startup and after each `TransactionsReady` / `TransactionsUpdated` (whose
+/// `abandoned_then_mined_ids` flags the mined case as it is found). For a
+/// `MinedAfterAbandon` entry, warn the user that a send they abandoned was mined, so a
+/// payment made again since may have paid twice; nothing is done automatically. An
+/// entry is never withdrawn. Synchronous.
+///
+/// Errors: `Database is not initialized`, `No accounts found for this wallet`,
+/// `Database Error: …`.
+#[frb]
+pub fn get_abandon_warnings(wallet_name: String) -> Result<Vec<AbandonWarningDto>> {
+    let conn = get_db_connection()?;
+    let accounts = get_accounts(&conn, Some(&wallet_name))
+        .map_err(|e| WalletError::database(e.to_string()))?;
+    let account = accounts.first().ok_or(WalletError::NoAccounts)?;
+    Ok(abandon_warnings(&conn, account.id)?
+        .into_iter()
+        .map(Into::into)
+        .collect())
+}
+
+/// The after-abandon warnings of account `account_id`, from all its stored events.
+pub(crate) fn abandon_warnings(
+    conn: &r2d2_sqlite::rusqlite::Connection,
+    account_id: i64,
+) -> Result<Vec<abandon::AbandonWarning>> {
+    let mut events = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = get_events_by_account_id(conn, account_id, ABANDON_EVENTS_PAGE_SIZE, offset)
+            .map_err(|e| WalletError::database(e.to_string()))?;
+        let read = page.len();
+        for row in page {
+            // A row this build cannot read (e.g. a newer minotari's event) is no
+            // warning it knows of.
+            match row
+                .data_json
+                .as_deref()
+                .map(serde_json::from_str::<WalletEventType>)
+            {
+                Some(Ok(event)) => events.push((row.id, event)),
+                Some(Err(e)) => log::debug!("Skipping unreadable wallet event {}: {e}", row.id),
+                None => {}
+            }
+        }
+        if read < ABANDON_EVENTS_PAGE_SIZE as usize {
+            break;
+        }
+        offset += ABANDON_EVENTS_PAGE_SIZE;
+    }
+    Ok(abandon::pair_abandon_warnings(events))
+}
+
+/// Resolves `Ok` even when the node has not accepted the send yet: it is recorded and
+/// rebroadcast, so it must not be sent again.
+#[frb(ignore)]
+pub async fn send_transaction_with_handler<F>(
+    details: MultiSendTransactionDetails,
+    status_callback: F,
+) -> Result<SendResultDto>
+where
+    F: Fn(SendTransactionEvent) + Send + Sync + 'static,
+{
+    send_transaction_at_fee_with_handler(details, SEND_FEE_PER_GRAM, status_callback).await
+}
+
+/// [`send_transaction_with_handler`] built at `fee_per_gram` (µT per gram).
+#[frb(ignore)]
+pub async fn send_transaction_at_fee_with_handler<F>(
+    details: MultiSendTransactionDetails,
+    fee_per_gram: u64,
+    status_callback: F,
+) -> Result<SendResultDto>
+where
+    F: Fn(SendTransactionEvent) + Send + Sync + 'static,
+{
+    send_at_fee_inner(details, fee_per_gram, None, status_callback).await
+}
+
+/// The same workflow with an absolute, user-confirmed kernel-fee ceiling.
+#[frb(ignore)]
+pub async fn send_transaction_at_fee_limit_with_handler<F>(
+    details: MultiSendTransactionDetails,
+    fee_per_gram: u64,
+    max_fee: u64,
+    status_callback: F,
+) -> Result<SendResultDto>
+where
+    F: Fn(SendTransactionEvent) + Send + Sync + 'static,
+{
+    send_at_fee_inner(details, fee_per_gram, Some(max_fee), status_callback).await
+}
+
+async fn send_at_fee_inner<F>(
+    mut details: MultiSendTransactionDetails,
+    fee_per_gram: u64,
+    max_fee: Option<u64>,
+    status_callback: F,
+) -> Result<SendResultDto>
+where
+    F: Fn(SendTransactionEvent) + Send + Sync + 'static,
+{
     let report = |stage: TransactionStage, msg: &str| {
         status_callback(SendTransactionEvent {
             stage,
             details: msg.to_string(),
+            result: None,
         });
     };
 
     report(TransactionStage::Initializing, "Starting workflow...");
 
     report(TransactionStage::ValidatingInput, "Parsing inputs...");
+    validate_fee_per_gram(fee_per_gram, MAX_FEE_PER_GRAM)?;
+    if max_fee == Some(0) {
+        return Err(WalletError::wallet("Confirmed maximum fee must be positive").into());
+    }
     let validated = validate_inputs(&details)?;
 
     apply_network(validated.network)?;
@@ -135,31 +466,36 @@ where
     );
     let mut sender = create_transaction_sender(
         &details.wallet_name,
-        &passphrase,
         validated.network,
         validated.confirmations,
+        fee_per_gram,
     )?;
-    if let Some((rate, _)) = fee_limits {
-        sender.fee_per_gram = MicroMinotari(rate);
-    }
 
-    // Derive the signing key manager and prove it belongs to this account *before*
-    // `start_new_transaction` reserves any UTXO. Since the bump, `sign_locked_transaction`
-    // verifies a payload-integrity signature made with the preparing wallet's view key,
-    // so a seed/account mismatch fails at signing — by which point the inputs are already
-    // `Locked` and must be released again (see `release_send_reservation`). Checking first
-    // makes that mismatch cost nothing.
-    //
-    // No stage event is emitted here: the streamed `TransactionStage` sequence is frozen
-    // contract, so `SigningKeyGeneration` stays at its original position below.
-    let key_manager = key_manager_from_seed_words(&seed_words)?;
-    verify_seed_words_match_account(&details.wallet_name, &passphrase, &key_manager)?;
+    // Load the signing keys from the session *before* the transaction reserves any
+    // UTXO, so a locked or view-only wallet costs nothing. No stage event is emitted
+    // here; `SigningKeyGeneration` stays at its position below.
+    let key_manager = stored_key_manager(&details.wallet_name)?;
 
     // Best-effort: free inputs a stale reservation still holds before selecting new ones.
     match get_db_connection() {
         Ok(conn) => release_expired_reservations(&conn),
         Err(e) => log::warn!("Could not check for expired UTXO reservations: {e}"),
     }
+
+    // A resend after an abandon: find the released inputs it must spend, before any
+    // UTXO is reserved.
+    let conflict = match validated.conflicts_with {
+        Some(tx_id) => Some(resolve_conflict(
+            &*sender
+                .db_pool
+                .get()
+                .map_err(|e| WalletError::database(e.to_string()))?,
+            sender.account.id,
+            tx_id,
+            validated.confirmations,
+        )?),
+        None => None,
+    };
 
     report(
         TransactionStage::ConstructingTransaction,
@@ -168,16 +504,20 @@ where
     // From here on UTXOs are reserved. Upstream releases them on most of its failure
     // paths; the bridge releases on a signing failure and again as a backstop on a
     // finalize failure, which does nothing once the send is recorded.
-    let (pending_transaction_id, unsigned_tx) = build_unsigned_transaction(
+    let (pending_transaction_id, unsigned_tx) = build_while_unlocked(
         &mut sender,
-        validated.recipient_address,
-        validated.amount,
-        details.payment_id.take(),
+        &details.wallet_name,
+        validated.recipients,
+        details.send_all,
+        conflict.as_ref().map(|c| c.required_inputs.as_slice()),
     )?;
+    if let Some(conflict) = &conflict {
+        ensure_conflicts(&unsigned_tx, conflict, &pending_transaction_id)?;
+    }
 
     report(
         TransactionStage::SigningKeyGeneration,
-        "Deriving keys from seed...",
+        "Loading signing keys...",
     );
 
     report(
@@ -187,32 +527,47 @@ where
 
     let consensus_constants = ConsensusConstantsBuilder::new(validated.network).build();
 
-    let signed_transaction = match sign_locked_transaction(
-        &key_manager,
-        consensus_constants,
-        validated.network,
-        unsigned_tx,
-    ) {
+    let signed = confirm_own_payload(unsigned_tx).and_then(|confirmed| {
+        sign_locked_transaction(
+            &key_manager,
+            consensus_constants,
+            validated.network,
+            confirmed,
+        )
+        .map_err(map_signing_error)
+    });
+    let signed_transaction = match signed {
         Ok(tx) => tx,
         Err(e) => {
             release_send_reservation(&pending_transaction_id);
-            return Err(map_signing_error(e).into());
+            return Err(e.into());
         }
     };
 
-    let actual_fee = match kernel_fee(&signed_transaction.signed_transaction.transaction) {
+    let actual_fee = match crate::domain::history::kernel_fee(
+        &signed_transaction.signed_transaction.transaction,
+    ) {
         Ok(fee) => fee,
         Err(error) => {
             release_send_reservation(&pending_transaction_id);
             return Err(error);
         }
     };
-    if let Some((_, maximum)) = fee_limits {
-        if let Err(error) = validate_confirmed_fee(actual_fee, maximum) {
-            release_send_reservation(&pending_transaction_id);
-            return Err(error);
-        }
+    if max_fee.is_some_and(|maximum| actual_fee > maximum) {
+        release_send_reservation(&pending_transaction_id);
+        return Err(WalletError::wallet(
+            "Transaction fee exceeds the confirmed maximum; request a new quote",
+        )
+        .into());
     }
+
+    // Finalize reads the keys again (change output) through the session. Never record
+    // or broadcast unless the wallet is seen unlocked, in the send's own database.
+    if !unlocked_in(&sender.db_pool, &details.wallet_name) {
+        release_send_reservation(&pending_transaction_id);
+        return Err(WalletError::Locked.into());
+    }
+
     report(TransactionStage::Broadcasting, "Broadcasting to network...");
 
     let base_url = details
@@ -220,36 +575,61 @@ where
         .take()
         .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
 
-    let mut result_tx = match sender
+    let mut sent = match sender
         .finalize_transaction_and_broadcast(signed_transaction, base_url)
         .await
     {
-        Ok(sent) => {
-            // Finalization has recorded the send even when the first broadcast
-            // was not accepted. Treat it as pending, never invite a duplicate send.
-            if !sent.accepted_by_node {
-                log::warn!(
-                    "Send recorded but not yet accepted by the node: note={:?}, node_reason={:?}",
-                    sent.note,
-                    sent.node_reason
-                );
-            }
-            sent.displayed_transaction
-        }
+        Ok(sent) => sent,
         Err(e) => {
             release_send_reservation(&pending_transaction_id);
-            return Err(WalletError::network(e.to_string()).into());
+            // A lock during finalize makes its key read fail with a decryption error.
+            if session_gone(&details.wallet_name) {
+                return Err(WalletError::Locked.into());
+            }
+            return Err(WalletError::network(strip_format_chars(&e.to_string())).into());
         }
     };
+    // The send is recorded either way; a send the node has not accepted is
+    // rebroadcast by the scan's transaction monitor and must not be retried.
+    if !sent.accepted_by_node {
+        log::warn!(
+            "Send recorded but not yet accepted by the node: note={:?}, node_reason={:?}",
+            sent.note,
+            sent.node_reason
+        );
+    }
 
-    crate::api::transactions::record_transaction_changes(
-        result_tx.details.account_id,
-        [result_tx.id.to_string()],
-    );
-    report(TransactionStage::Completed, "Transaction sent");
+    // The final event carries exactly what the call resolves to.
+    // Use the kernels we actually signed; no fallible post-broadcast database read.
+    crate::domain::history::normalize_local_send(&mut sent.displayed_transaction, actual_fee);
+    let result = SendResultDto::from(sent);
+    status_callback(SendTransactionEvent {
+        stage: TransactionStage::Broadcasted,
+        details: "Transaction broadcast".to_string(),
+        result: Some(result.clone()),
+    });
 
-    normalize_local_send(&mut result_tx, actual_fee);
-    Ok(result_tx.into())
+    Ok(result)
+}
+
+/// Approve this process's own payload for signing, without a prompt.
+///
+/// The payload was built from this wallet's database just before signing, so there is
+/// no one to show the summary to; upstream logs it.
+fn confirm_own_payload(
+    unsigned_tx: PrepareOneSidedTransactionForSigningResult,
+) -> Result<ConfirmedPayload<PrepareOneSidedTransactionForSigningResult>, WalletError> {
+    let summary = PayloadSummary::from_one_sided(unsigned_tx);
+    let confirmation = present_payload_summary(
+        &summary,
+        ConfirmationMode::NonInteractive,
+        &mut std::io::sink(),
+        &mut std::io::empty(),
+    )
+    .map_err(|e| WalletError::signing(e.to_string()))?;
+    summary
+        .confirm(confirmation)
+        .map_err(|e| WalletError::signing(e.to_string()))
 }
 
 /// Release the UTXOs this send reserved, best-effort.
@@ -284,108 +664,44 @@ fn release_send_reservation(pending_transaction_id: &str) {
     }
 }
 
-// Preparation can fail before its pending row ID is returned. Resolve it by the
-// account-scoped idempotency key so this failure path also releases its inputs.
-fn release_send_reservation_by_key(idempotency_key: &str, account_id: i64) {
-    let released = get_db_connection()
-        .map_err(|e| e.to_string())
-        .and_then(|conn| {
-            // Locks refer to pending_transactions.id, not its idempotency key.
-            let pending = minotari_wallet::db::find_pending_transaction_record_by_idempotency_key(
-                &conn,
-                idempotency_key,
-                account_id,
-            )
-            .map_err(|e| e.to_string())?;
-            match pending {
-                Some(record) => expire_and_unlock_pending_transaction(&conn, &record.id)
-                    .map_err(|e| e.to_string()),
-                None => Ok(false),
-            }
-        });
-
-    match released {
-        Ok(true) => log::info!("Released the UTXO reservation for a failed send"),
-        // Already `Completed`/`Expired`: nothing to release, which is the safe outcome.
-        Ok(false) => log::debug!("No pending UTXO reservation to release for a failed send"),
-        Err(e) => log::warn!(
-            "Failed to release the UTXO reservation for a failed send; these outputs stay \
-             locked until the reservation expires and the next send, scan or init sweeps it: {e}"
-        ),
-    }
-}
-
-/// Check that `key_manager` (derived from the caller's seed words) controls the same
-/// wallet as the stored account.
-///
-/// Compares public **view keys**, which is exactly the equality
-/// `sign_locked_transaction`'s payload-signature check enforces later, so this accepts
-/// precisely the inputs signing would accept — it cannot reject a send that would have
-/// worked.
-fn verify_seed_words_match_account(
-    wallet_name: &str,
-    passphrase: &str,
-    key_manager: &KeyManager,
-) -> Result<()> {
+/// The wallet's key manager from its unlocked session.
+fn stored_key_manager(wallet_name: &str) -> Result<KeyManager> {
     let conn = get_db_connection()?;
-    let accounts = get_accounts(&conn, Some(wallet_name))?;
-    let account = accounts.first().ok_or(WalletError::NoAccounts)?;
-
-    let stored_view_key = account
-        .decrypt_wallet_type(passphrase)
-        .map_err(|e| WalletError::wallet(e.to_string()))?
-        .get_public_view_key();
-
-    if key_manager.get_view_key().pub_key != stored_view_key {
-        return Err(WalletError::signing(SEED_WORDS_ACCOUNT_MISMATCH).into());
+    let account = unlocked_account(&conn, wallet_name)?;
+    // An empty passphrase makes minotari use the session.
+    let wallet = with_session(&conn, wallet_name, || {
+        account
+            .decrypt_wallet_type("")
+            .map_err(|e| WalletError::wallet(e.to_string()).into())
+    })?;
+    // Refuse before any UTXO is reserved: a view key cannot sign.
+    if matches!(wallet, WalletType::ViewWallet(_)) {
+        return Err(WalletError::signing("View-only wallets cannot send").into());
     }
-
-    Ok(())
-}
-
-/// The Dart-visible explanation for a seed/account mismatch.
-///
-/// Upstream's own message for this condition says the payload "was tampered with in
-/// transit or is corrupt", which for this bridge is almost always wrong and actively
-/// harmful: the real cause is a wrong passphrase or the wrong wallet, and telling users
-/// their transaction was tampered with invites false security reports. This is a **new**
-/// `details` string carried by the existing `WalletError::Signing` variant — the
-/// `#[error("Signing Error: {details}")]` format itself is unchanged.
-pub(crate) const SEED_WORDS_ACCOUNT_MISMATCH: &str =
-    "The supplied seed words do not match this wallet account. Check that the wallet name, \
-     passphrase and seed words all belong to the same wallet.";
-
-fn validate_confirmed_fee(actual_fee: u64, maximum: u64) -> Result<()> {
-    if actual_fee > maximum {
-        anyhow::bail!("Transaction fee exceeds the confirmed estimate. Review the payment again.");
-    }
-    Ok(())
+    KeyManager::new(wallet).map_err(|e| WalletError::wallet(e.to_string()).into())
 }
 
 /// Convert an upstream signing failure into a [`WalletError::Signing`].
-///
-/// The payload-integrity failure is re-worded to [`SEED_WORDS_ACCOUNT_MISMATCH`] for the
-/// reason given there; every other signing failure keeps upstream's message verbatim.
 fn map_signing_error(e: TransactionBuilderError) -> WalletError {
-    let message = e.to_string();
-    if message.contains("Offline payload integrity check failed") {
-        WalletError::signing(SEED_WORDS_ACCOUNT_MISMATCH)
-    } else {
-        WalletError::signing(message)
-    }
+    WalletError::signing(e.to_string())
 }
 
-/// Build, sign, and broadcast a one-sided transaction, streaming progress.
+/// Pay one or more recipients in one transaction, or sweep the wallet to one
+/// recipient (`details.send_all`), streaming progress.
 ///
-/// Streams a [`SendTransactionEvent`] for each [`TransactionStage`] over `sink`
-/// and resolves to the recorded, `Pending` [`DisplayedTransactionDto`]. `details`
-/// carries the **secret** seed words/passphrase and the recipient/amount (in
-/// microTari). Requires [`initialize_database`] first.
+/// Streams a [`SendTransactionEvent`] for each [`TransactionStage`] over `sink` and
+/// resolves to a [`SendResultDto`]: the recorded, `Pending` transaction plus whether
+/// the node accepted it. FRB does not hand that return value to Dart, so the final
+/// `Broadcasted` event carries the same value in its `result` field; read the
+/// outcome there. The wallet must be unlocked; no seed words or passphrase are
+/// needed. Each recipient gets its own output carrying its own `payment_id`.
 ///
-/// `Ok` means the send is recorded, not necessarily accepted by the node; the
-/// scan's transaction monitor rebroadcasts it, so **do not resend after `Ok`**.
-/// Rebroadcast only happens while `start_scan` runs.
-/// `Network Error` only comes from failures before the send is recorded.
+/// `Ok` means the send is recorded, not necessarily accepted by the node; the scan's
+/// transaction monitor rebroadcasts it while a scan runs, so **never resend after
+/// `Ok`**. Confirmation is reported by the scanner (`TransactionsUpdated`), not by
+/// this stream. `Network Error` only comes from failures before the send is
+/// recorded. Once a send has stalled, [`abandon_send`] releases its inputs (see there
+/// before paying the same payee again).
 ///
 /// Async and streamed. The send **continues even if the Dart stream is closed**
 /// (a half-broadcast transaction must finish) — this deliberately differs from
@@ -394,80 +710,261 @@ fn map_signing_error(e: TransactionBuilderError) -> WalletError {
 #[frb]
 pub async fn send_transaction(
     sink: StreamSink<SendTransactionEvent>,
-    details: SendTransactionDetails,
-) -> Result<DisplayedTransactionDto> {
-    let stream_sink = sink.clone();
-
+    details: MultiSendTransactionDetails,
+) -> Result<SendResultDto> {
     send_transaction_with_handler(details, move |event| {
-        // SEND deliberately ignores sink-closed: a half-broadcast transaction must
-        // still finish even if the Dart UI stopped listening (aborting could lose
-        // funds). This is the asymmetric counterpart to SCAN, which *cancels* on
-        // sink-closed — see `scanner.rs::run_forwarder` for the full rationale.
-        let _ = stream_sink.add(event);
+        // A closed sink never aborts a send: aborting a half-broadcast transaction
+        // could lose funds. Scans, by contrast, cancel (see `scanner::run_forwarder`).
+        let _ = sink.add(event);
     })
     .await
 }
 
-/// Send at an explicitly confirmed rate, refusing a fee above `max_fee` before
-/// broadcasting and releasing the reservation on refusal. Rate is microTari per
-/// gram; max_fee is microTari. Existing send API and DTO remain unchanged.
+/// [`send_transaction`] built at `fee_per_gram` (µT per gram) instead of the default
+/// rate: pass the `fee_per_gram` of the
+/// [`FeeEstimate`](crate::api::fee::FeeEstimate) the user confirmed, or for a send-all
+/// the rate given to
+/// [`estimate_send_all_fee_at`](crate::api::fee::estimate_send_all_fee_at). The send is
+/// built at exactly that rate. Only a send-all's fee is exactly its quote; a normal
+/// send's fee can differ from the estimate's `estimated_fee`. A rate of 0 or above the cap errors with
+/// `Invalid fee per gram: …` before any UTXO is reserved. Otherwise as
+/// [`send_transaction`], including that a closed sink does not abort the send.
 #[frb]
-pub async fn send_transaction_with_fee(
+pub async fn send_transaction_at_fee(
     sink: StreamSink<SendTransactionEvent>,
-    details: SendTransactionDetails,
+    details: MultiSendTransactionDetails,
+    fee_per_gram: u64,
+) -> Result<SendResultDto> {
+    send_transaction_at_fee_with_handler(details, fee_per_gram, move |event| {
+        // As `send_transaction`: never abort a half-broadcast send.
+        let _ = sink.add(event);
+    })
+    .await
+}
+
+/// Send at the selected rate, refusing to broadcast if the actual signed kernel fee
+/// exceeds the total fee confirmed in Cake. Releases reservations on refusal.
+/// A closed sink continues an already-broadcast send, exactly as the older APIs do.
+#[frb]
+pub async fn send_transaction_at_fee_limit(
+    sink: StreamSink<SendTransactionEvent>,
+    details: MultiSendTransactionDetails,
     fee_per_gram: u64,
     max_fee: u64,
-) -> Result<()> {
-    let events = sink.clone();
-    let result =
-        send_transaction_with_fee_handler(details, Some((fee_per_gram, max_fee)), move |event| {
-            let _ = events.add(event);
+) -> Result<SendResultDto> {
+    send_transaction_at_fee_limit_with_handler(details, fee_per_gram, max_fee, move |event| {
+        let _ = sink.add(event);
+    })
+    .await
+}
+
+/// Quote a concrete ordinary send using its recipients, memos and selected rate.
+/// No inputs are reserved and nothing is broadcast. The absolute fee is conservative;
+/// `send_transaction_at_fee_limit` checks the signed fee again before broadcast.
+#[frb]
+pub async fn estimate_send_fee(
+    details: MultiSendTransactionDetails,
+    priority: crate::api::fee::FeePriority,
+) -> Result<crate::api::fee::FeeEstimate> {
+    use minotari_wallet::transactions::{
+        fee_estimator::estimated_output_size_for_recipients, input_selector::InputSelector,
+    };
+    let validated = validate_inputs(&details)?;
+    anyhow::ensure!(
+        !details.send_all,
+        "Use estimate_send_all_fee_at for a sweep"
+    );
+    let pool = get_db_pool()?;
+    let fee_per_gram = crate::api::fee::get_fee_per_gram(
+        priority,
+        details
+            .base_url
+            .clone()
+            .unwrap_or_else(|| DEFAULT_BASE_URL.to_owned()),
+    )
+    .await?;
+    let output_size = estimated_output_size_for_recipients(&validated.recipients)?;
+    let amount = validated
+        .recipients
+        .iter()
+        .try_fold(0u64, |total, recipient| {
+            total
+                .checked_add(recipient.amount.0)
+                .ok_or_else(|| anyhow::anyhow!("Recipient total overflows"))
+        })?;
+    blocking(move || {
+        let conn = pool.get()?;
+        let account = minotari_wallet::db::get_account_by_name(&conn, &details.wallet_name)?
+            .ok_or(WalletError::NoAccounts)?;
+        // A resend must quote the same released inputs it will spend at signing.
+        let required_inputs = match validated.conflicts_with {
+            Some(tx_id) => {
+                resolve_conflict(&conn, account.id, tx_id, validated.confirmations)?.required_inputs
+            }
+            None => Vec::new(),
+        };
+        let selection = InputSelector::new(account.id, validated.confirmations)
+            .fetch_unspent_outputs_with_required(
+                &conn,
+                MicroMinotari(amount),
+                validated.recipients.len(),
+                MicroMinotari(fee_per_gram),
+                Some(output_size),
+                &required_inputs,
+            )?;
+        let fee = selection.fee().0;
+        Ok(crate::api::fee::FeeEstimate {
+            estimated_fee: fee,
+            total_amount_required: amount
+                .checked_add(fee)
+                .ok_or_else(|| anyhow::anyhow!("Amount plus fee overflows"))?,
+            fee_per_gram,
+            input_count: selection.utxos.len(),
         })
-        .await;
-    if let Err(error) = result {
-        // FRB runs this function on a separate unawaited normal-task channel.
-        // Return errors on the stream Cake listens to before dropping its sink;
-        // do not leave an unhandled error on the normal-task Future instead.
-        let _ = sink.add_error(error);
-    }
-    Ok(())
+    })
+    .await
 }
 
-/// Thin adapter: resolve the network (frozen `None → MainNet` default) and hand the
-/// raw fields to the pure domain validator. `WalletError` is converted to the
-/// boundary `anyhow::Error` via `?`.
-fn validate_inputs(details: &SendTransactionDetails) -> Result<ValidatedInputs> {
+/// Thin adapter: resolve the network (frozen `None → MainNet` default), validate each
+/// recipient with the pure domain validator and apply the confirmation-window default.
+/// `WalletError` is converted to the boundary `anyhow::Error` via `?`.
+fn validate_inputs(details: &MultiSendTransactionDetails) -> Result<ValidatedInputs> {
     let network = parse_network(details.network);
-    let validated = validate_send_inputs(
+    validate_recipient_count(details.recipients.len(), details.send_all)?;
+
+    let mut recipients = Vec::with_capacity(details.recipients.len());
+    for r in &details.recipients {
+        let address = validate_recipient(network, &r.address, r.amount, details.send_all)?;
+        recipients.push(Recipient {
+            address,
+            amount: MicroMinotari(r.amount),
+            payment_id: r.payment_id.clone(),
+        });
+    }
+
+    let conflicts_with = details
+        .conflicts_with_transaction_id
+        .as_deref()
+        .map(parse_transaction_id)
+        .transpose()?;
+
+    Ok(ValidatedInputs {
         network,
-        &details.recipient_address,
-        details.amount,
-        details.confirmation_window,
-    )?;
-    Ok(validated)
+        recipients,
+        confirmations: details
+            .confirmation_window
+            .unwrap_or(DEFAULT_CONFIRMATION_WINDOW),
+        conflicts_with,
+    })
 }
 
-/// Build the [`TransactionSender`] for `wallet_name`.
+/// What a resend of account `account_id` needs to conflict with its abandoned send
+/// `tx_id`: the send's released inputs that are spendable now (as the input selector
+/// sees them under `confirmation_window`), and the output hashes of all its inputs.
 ///
-/// `passphrase` is borrowed from the caller's zeroizing container and copied once into
-/// the `Zeroizing<String>` that `TransactionSender::new` takes ownership of, so the
-/// plaintext exists only inside zeroizing containers for the whole call chain.
+/// Refuses with [`NOT_AN_ABANDONED_SEND`] when the account has no send `tx_id` or it is
+/// not `Rejected` as abandoned, and with [`NO_SPENDABLE_RELEASED_INPUT`] when none of
+/// its inputs is spendable.
+fn resolve_conflict(
+    conn: &r2d2_sqlite::rusqlite::Connection,
+    account_id: i64,
+    tx_id: TxId,
+    confirmation_window: u64,
+) -> Result<Conflict, WalletError> {
+    let released = abandoned_send_inputs(conn, account_id, tx_id).map_err(|e| match e {
+        AbandonedSendInputsError::NotFound(_) | AbandonedSendInputsError::NotAbandoned { .. } => {
+            WalletError::wallet(NOT_AN_ABANDONED_SEND)
+        }
+        AbandonedSendInputsError::Db(e) => WalletError::database(e.to_string()),
+        other => WalletError::wallet(other.to_string()),
+    })?;
+
+    // The input selector's own view of what is spendable.
+    let tip_height = get_latest_scanned_tip_block_by_account(conn, account_id)
+        .map_err(|e| WalletError::database(e.to_string()))?
+        .map(|b| b.height)
+        .unwrap_or(0);
+    let spendable: Vec<i64> = fetch_unspent_outputs(
+        conn,
+        account_id,
+        tip_height.saturating_sub(confirmation_window),
+        tip_height,
+    )
+    .map_err(|e| WalletError::database(e.to_string()))?
+    .iter()
+    .map(|output| output.id)
+    .collect();
+    let required_inputs = abandon::spendable_released_inputs(&released, &spendable);
+    if required_inputs.is_empty() {
+        return Err(WalletError::wallet(NO_SPENDABLE_RELEASED_INPUT));
+    }
+
+    let mut original_inputs = Vec::with_capacity(released.len());
+    for output_id in &released {
+        original_inputs.push(output_hash(conn, account_id, *output_id)?);
+    }
+    Ok(Conflict {
+        required_inputs,
+        original_inputs,
+    })
+}
+
+/// The output hash of account `account_id`'s output `output_id`.
+fn output_hash(
+    conn: &r2d2_sqlite::rusqlite::Connection,
+    account_id: i64,
+    output_id: i64,
+) -> Result<Vec<u8>, WalletError> {
+    match get_output_by_id(conn, output_id) {
+        Ok(Some(output)) if output.account_id == account_id => Ok(output.output_hash),
+        Ok(_) => Err(WalletError::database(format!(
+            "output {output_id} not found"
+        ))),
+        Err(e) => Err(WalletError::database(e.to_string())),
+    }
+}
+
+/// Defence in depth before signing: the built transaction must spend at least one
+/// input of the abandoned send. Otherwise its reservation is released and the send
+/// refused with [`RESEND_DOES_NOT_CONFLICT`].
+fn ensure_conflicts(
+    unsigned_tx: &PrepareOneSidedTransactionForSigningResult,
+    conflict: &Conflict,
+    pending_transaction_id: &str,
+) -> Result<(), WalletError> {
+    let inputs: Vec<Vec<u8>> = unsigned_tx
+        .info
+        .inputs
+        .iter()
+        .map(|input| input.output_hash().to_vec())
+        .collect();
+    if abandon::shares_an_input(&inputs, &conflict.original_inputs) {
+        return Ok(());
+    }
+    log::warn!("A resend shares no input with the abandoned send; refusing it");
+    release_send_reservation(pending_transaction_id);
+    Err(WalletError::wallet(RESEND_DOES_NOT_CONFLICT))
+}
+
+/// Build the [`TransactionSender`] for `wallet_name`, which uses its key session.
 fn create_transaction_sender(
     wallet_name: &str,
-    passphrase: &str,
     network: Network,
     confirmations: u64,
+    fee_per_gram: u64,
 ) -> Result<TransactionSender> {
     let db_pool = get_db_pool().map_err(|e| WalletError::database(e.to_string()))?;
 
-    TransactionSender::new(
+    let mut sender = TransactionSender::new(
         db_pool,
         wallet_name.to_string(),
-        Zeroizing::new(passphrase.to_string()),
+        Zeroizing::new(String::new()),
         network,
         confirmations,
     )
-    .map_err(|e| WalletError::wallet(e.to_string()).into())
+    .map_err(|e| WalletError::wallet(e.to_string()))?;
+    sender.fee_per_gram = MicroMinotari(fee_per_gram);
+    Ok(sender)
 }
 
 /// Reserve inputs and build the unsigned transaction.
@@ -475,35 +972,107 @@ fn create_transaction_sender(
 /// Returns the id of the pending row that now holds the `Locked` UTXOs alongside the
 /// payload; the caller needs it to release them if a later step fails (see
 /// [`release_send_reservation`]).
+/// [`build_unsigned_transaction`], reporting `Wallet is locked` if the wallet was locked
+/// meanwhile. The build reads the keys through the session with an empty passphrase;
+/// after a lock it fails with a decryption error, or, for a wallet whose passphrase is
+/// empty, succeeds through minotari's fallback. In that case the reservation is
+/// released and nothing is signed.
+fn build_while_unlocked(
+    sender: &mut TransactionSender,
+    wallet_name: &str,
+    recipients: Vec<Recipient>,
+    send_all: bool,
+    required_inputs: Option<&[i64]>,
+) -> Result<(String, PrepareOneSidedTransactionForSigningResult)> {
+    let (pending_transaction_id, unsigned_tx) =
+        build_unsigned_transaction(sender, recipients, send_all, required_inputs).map_err(|e| {
+            if session_gone(wallet_name) {
+                WalletError::Locked.into()
+            } else {
+                e
+            }
+        })?;
+    if !unlocked_in(&sender.db_pool, wallet_name) {
+        release_send_reservation(&pending_transaction_id);
+        return Err(WalletError::Locked.into());
+    }
+    Ok((pending_transaction_id, unsigned_tx))
+}
+
+/// The send's gate: `true` only if `wallet_name` is known to be unlocked, checked on
+/// the send's own pool (not the global path, which the other engine could change).
+/// Any error reads as locked, so the gate fails closed.
+fn unlocked_in(pool: &minotari_wallet::db::SqlitePool, wallet_name: &str) -> bool {
+    pool.get()
+        .ok()
+        .is_some_and(|conn| matches!(is_unlocked(&conn, wallet_name), Ok(true)))
+}
+
+/// Whether `wallet_name` is still the account with `account_id`: a rename or delete
+/// (and a re-create under the same name) between reading the id and acting on it is
+/// refused.
+fn same_account(
+    conn: &r2d2_sqlite::rusqlite::Connection,
+    wallet_name: &str,
+    account_id: i64,
+) -> Result<()> {
+    let accounts = get_accounts(conn, Some(wallet_name))?;
+    let account = accounts.first().ok_or(WalletError::NoAccounts)?;
+    if account.id != account_id {
+        return Err(WalletError::wallet(WALLET_REPLACED).into());
+    }
+    Ok(())
+}
+
+/// The Dart-visible reason an abandon is refused because its wallet changed meanwhile.
+const WALLET_REPLACED: &str = "The wallet was renamed or replaced; try again";
+
+/// Reserve inputs and build the unsigned transaction; with `required_inputs`
+/// (`outputs` row ids) those are always spent, otherwise minotari selects every input.
 fn build_unsigned_transaction(
     sender: &mut TransactionSender,
-    address: TariAddress,
-    amount: MicroMinotari,
-    payment_id: Option<String>,
+    mut recipients: Vec<Recipient>,
+    send_all: bool,
+    required_inputs: Option<&[i64]>,
 ) -> Result<(String, PrepareOneSidedTransactionForSigningResult)> {
-    let recipient = Recipient {
-        address,
-        amount,
-        payment_id,
-    };
-
     let idempotency_key = uuid::Uuid::new_v4().to_string();
 
-    let tx = match sender.start_new_transaction(
-        idempotency_key.clone(),
-        recipient,
-        SECONDS_TO_LOCK_UTXO,
-    ) {
-        Ok(tx) => tx,
-        Err(error) => {
-            // Upstream can reserve inputs and then fail while preparing the
-            // payload. The caller never receives the key on this error path.
-            release_send_reservation_by_key(&idempotency_key, sender.account.id);
-            return Err(
-                WalletError::wallet(format!("Failed to build transaction: {}", error)).into(),
-            );
+    let tx = if send_all {
+        // `validate_recipient_count` guarantees exactly one recipient here.
+        let recipient = recipients
+            .pop()
+            .ok_or_else(|| WalletError::wallet("A send-all pays exactly one recipient"))?;
+        match required_inputs {
+            None => sender.start_new_send_all_transaction(
+                idempotency_key,
+                recipient.address,
+                recipient.payment_id,
+                SECONDS_TO_LOCK_UTXO,
+            ),
+            Some(required) => sender.start_new_send_all_transaction_with_inputs(
+                idempotency_key,
+                recipient.address,
+                recipient.payment_id,
+                SECONDS_TO_LOCK_UTXO,
+                required,
+            ),
         }
-    };
+    } else {
+        match required_inputs {
+            None => sender.start_new_transaction_multi(
+                idempotency_key,
+                recipients,
+                SECONDS_TO_LOCK_UTXO,
+            ),
+            Some(required) => sender.start_new_transaction_multi_with_inputs(
+                idempotency_key,
+                recipients,
+                SECONDS_TO_LOCK_UTXO,
+                required,
+            ),
+        }
+    }
+    .map_err(|e| WalletError::wallet(format!("Failed to build transaction: {}", e)))?;
 
     Ok((sender.processed_transactions.id().to_string(), tx))
 }
@@ -520,18 +1089,10 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use tari_common_types::tari_address::TariAddress;
     use tari_common_types::types::CompressedPublicKey;
     use tari_crypto::ristretto::RistrettoSecretKey;
     use tari_utilities::ByteArray;
-
-    #[test]
-    fn confirmed_fee_is_an_upper_bound_including_uint64_edges() {
-        assert!(validate_confirmed_fee(1, 1).is_ok());
-        assert!(validate_confirmed_fee(1, u64::MAX).is_ok());
-        assert!(validate_confirmed_fee(u64::MAX, u64::MAX).is_ok());
-        assert!(validate_confirmed_fee(2, 1).is_err());
-        assert!(validate_confirmed_fee(u64::MAX, 1).is_err());
-    }
 
     /// Build a deterministic, valid base58 Tari (dual) address from fixed key
     /// bytes. The bytes are small little-endian scalars (well below the group
@@ -561,17 +1122,19 @@ mod tests {
         recipient: String,
         amount: u64,
         confirmation_window: Option<u64>,
-    ) -> SendTransactionDetails {
-        SendTransactionDetails {
-            seed_words: Vec::new(),
-            passphrase: None,
+    ) -> MultiSendTransactionDetails {
+        MultiSendTransactionDetails {
             network: Some(TariNetwork::MainNet),
             base_url: None,
             wallet_name: "test-wallet".to_string(),
-            recipient_address: recipient,
-            amount,
-            payment_id: None,
+            recipients: vec![SendRecipient {
+                address: recipient,
+                amount,
+                payment_id: None,
+            }],
+            send_all: false,
             confirmation_window,
+            conflicts_with_transaction_id: None,
         }
     }
 
@@ -666,11 +1229,12 @@ mod tests {
             TransactionStage::Initializing,
             TransactionStage::ValidatingInput,
             TransactionStage::Broadcasting,
-            TransactionStage::Completed,
+            TransactionStage::Broadcasted,
         ] {
             status_callback(SendTransactionEvent {
                 stage,
                 details: String::new(),
+                result: None,
             });
         }
 
@@ -679,89 +1243,54 @@ mod tests {
         let got = delivered.lock().unwrap();
         assert_eq!(got.len(), 4, "all stages reported even with a closed sink");
         assert!(matches!(got[0], TransactionStage::Initializing));
-        assert!(matches!(got[3], TransactionStage::Completed));
+        assert!(matches!(got[3], TransactionStage::Broadcasted));
     }
 
-    /// The secrets are *moved* out of the caller-owned `SendTransactionDetails`, not
-    /// cloned, so no un-wiped duplicate of the seed words or passphrase is left behind
-    /// in the struct. This mirrors the first statements of `send_transaction_with_handler`.
-    #[test]
-    fn secrets_are_moved_out_of_details_leaving_no_copy_behind() {
-        let mut details = details_with(deterministic_recipient_base58(Network::MainNet), 1, None);
-        details.seed_words = vec!["word-a".to_string(), "word-b".to_string()];
-        details.passphrase = Some("a-passphrase".to_string());
+    /// Sending needs the wallet's session: a locked wallet is refused before any UTXO
+    /// is reserved, and an unlocked one signs and builds with no seed words or
+    /// passphrase.
+    #[tokio::test]
+    async fn sending_needs_an_unlocked_session_and_no_seed_words() {
+        use crate::api::db::{
+            lock_wallet, set_database_path, unlock_wallet, GLOBAL_STATE_TEST_LOCK,
+        };
 
-        let seed_words = Zeroizing::new(std::mem::take(&mut details.seed_words));
-        let passphrase = Zeroizing::new(
-            details
-                .passphrase
-                .take()
-                .unwrap_or_else(|| DEFAULT_PASSPHRASE.to_string()),
-        );
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let (dir, pool, _, _) = reserve_one_output();
+        drop(pool);
+        let path = dir.path().join("wallet.db").to_string_lossy().into_owned();
+        set_database_path(path.clone()).unwrap();
 
-        assert_eq!(
-            seed_words.len(),
-            2,
-            "the seed words moved into the container"
-        );
-        assert_eq!(&*passphrase, "a-passphrase");
-        assert!(
-            details.seed_words.is_empty(),
-            "no seed words may remain in the caller-owned struct"
-        );
-        assert!(
-            details.passphrase.is_none(),
-            "no passphrase may remain in the caller-owned struct"
-        );
-    }
+        let err = stored_key_manager("test")
+            .err()
+            .expect("a locked wallet cannot send");
+        assert_eq!(err.to_string(), "Wallet is locked");
 
-    /// Characterization test for the seed/account mismatch message.
-    ///
-    /// Pins two things: that the mismatch is reported through the **existing**
-    /// `Signing Error: ` prefix (the frozen `#[error]` format is untouched), and that
-    /// the `details` we substitute does not repeat upstream's "tampered with in
-    /// transit" wording, which would push users towards false security reports.
-    #[test]
-    fn seed_account_mismatch_does_not_accuse_the_user_of_tampering() {
-        let rendered = WalletError::signing(SEED_WORDS_ACCOUNT_MISMATCH).to_string();
-
-        assert!(
-            rendered.starts_with("Signing Error: "),
-            "the frozen Signing error format must be unchanged, got {rendered:?}"
-        );
-        assert!(
-            rendered.contains("do not match this wallet account"),
-            "the message must name the real cause, got {rendered:?}"
-        );
-        for forbidden in ["tampered", "corrupt", "integrity"] {
-            assert!(
-                !rendered.to_lowercase().contains(forbidden),
-                "the message must not imply tampering (found {forbidden:?}) in {rendered:?}"
-            );
-        }
-    }
-
-    /// `map_signing_error` re-words only the payload-integrity failure and passes every
-    /// other upstream signing error through verbatim.
-    #[test]
-    fn map_signing_error_rewords_only_the_integrity_failure() {
-        let integrity = TransactionBuilderError::Other(
-            "Offline payload integrity check failed: payload signature is invalid. The payload \
-             was tampered with in transit or is corrupt."
-                .to_string(),
-        );
-        assert_eq!(
-            map_signing_error(integrity).to_string(),
-            WalletError::signing(SEED_WORDS_ACCOUNT_MISMATCH).to_string(),
-            "the integrity failure must be re-worded"
-        );
-
-        let other = TransactionBuilderError::Other("some other signing failure".to_string());
-        let rendered = map_signing_error(other).to_string();
-        assert!(
-            rendered.contains("some other signing failure"),
-            "unrelated signing errors must pass through verbatim, got {rendered:?}"
-        );
+        unlock_wallet(path, "test".into(), "pass".into()).unwrap();
+        stored_key_manager("test").expect("the session signs");
+        let mut sender =
+            create_transaction_sender("test", Network::LocalNet, 3, SEND_FEE_PER_GRAM).unwrap();
+        let conn = get_db_connection().unwrap();
+        let address = unlocked_account(&conn, "test")
+            .unwrap()
+            .get_address(Network::LocalNet, "")
+            .unwrap();
+        // The output the fixture reserved is still locked, so free it first.
+        conn.execute(
+            "UPDATE pending_transactions SET expires_at = '2000-01-01 00:00:00'",
+            [],
+        )
+        .unwrap();
+        release_expired_reservations(&conn);
+        let recipient = Recipient {
+            address,
+            amount: MicroMinotari(1_000),
+            payment_id: None,
+        };
+        build_unsigned_transaction(&mut sender, vec![recipient], false, None)
+            .expect("the session builds the transaction");
+        drop(conn);
+        lock_wallet("test".into()).await.unwrap();
     }
 
     /// A temp wallet DB (no globals) holding one spendable output that
@@ -773,6 +1302,37 @@ mod tests {
         i64,
         String,
     ) {
+        let (dir, pool, output_id) = funded_account("pass");
+        let conn = pool.get().unwrap();
+        let account = minotari_wallet::db::get_account_by_name(&conn, "test")
+            .unwrap()
+            .unwrap();
+        let address = account.get_address(Network::LocalNet, "pass").unwrap();
+        let mut sender = TransactionSender::new(
+            pool.clone(),
+            "test".to_string(),
+            Zeroizing::new("pass".to_string()),
+            Network::LocalNet,
+            3,
+        )
+        .unwrap();
+        let recipient = Recipient {
+            address,
+            amount: MicroMinotari(1_000),
+            payment_id: None,
+        };
+        let (pending_id, _) =
+            build_unsigned_transaction(&mut sender, vec![recipient], false, None).unwrap();
+
+        drop(conn);
+        (dir, pool, output_id, pending_id)
+    }
+
+    /// A temp wallet DB (no globals) with account "test" under `passphrase`, holding one
+    /// spendable output. Returns the temp dir (keep it alive), the pool and the output id.
+    fn funded_account(
+        passphrase: &str,
+    ) -> (tempfile::TempDir, minotari_wallet::db::SqlitePool, i64) {
         use minotari_wallet::db::{
             create_account, get_account_by_name, init_db, insert_output, insert_scanned_tip_block,
             mark_output_confirmed,
@@ -788,7 +1348,7 @@ mod tests {
 
         let wallet =
             WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
-        create_account(&conn, "test", &wallet, "pass").unwrap();
+        create_account(&conn, "test", &wallet, passphrase).unwrap();
         let account = get_account_by_name(&conn, "test").unwrap().unwrap();
         insert_scanned_tip_block(&conn, account.id, 200, &[0u8; 32]).unwrap();
 
@@ -829,20 +1389,114 @@ mod tests {
         .unwrap();
         mark_output_confirmed(&conn, &FixedHash::from([1u8; 32]), 100, &[0u8; 32]).unwrap();
 
-        let address = account.get_address(Network::LocalNet, "pass").unwrap();
-        let mut sender = TransactionSender::new(
-            pool.clone(),
-            "test".to_string(),
-            Zeroizing::new("pass".to_string()),
-            Network::LocalNet,
-            3,
+        drop(conn);
+        (dir, pool, output_id)
+    }
+
+    /// The pre-broadcast gate passes only on a positive "unlocked" from the send's own
+    /// pool: locked, an unknown wallet and an unreadable database all read as locked.
+    #[tokio::test]
+    async fn the_send_gate_fails_closed() {
+        use crate::api::db::{lock_wallet, unlock_wallet, GLOBAL_STATE_TEST_LOCK};
+
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let (dir, pool, _) = funded_account("pass");
+        assert!(!unlocked_in(&pool, "test"), "locked");
+        let path = dir.path().join("wallet.db").to_string_lossy().into_owned();
+        unlock_wallet(path, "test".into(), "pass".into()).unwrap();
+        assert!(unlocked_in(&pool, "test"), "unlocked");
+        assert!(!unlocked_in(&pool, "missing"), "unknown wallet");
+
+        // A pool whose database cannot be read.
+        let broken = tempfile::tempdir().unwrap();
+        let broken_pool = minotari_wallet::db::init_db(broken.path().join("wallet.db")).unwrap();
+        broken_pool
+            .get()
+            .unwrap()
+            .execute_batch("DROP TABLE accounts")
+            .unwrap();
+        assert!(
+            !unlocked_in(&broken_pool, "test"),
+            "a database error reads as locked"
+        );
+        lock_wallet("test".into()).await.unwrap();
+    }
+
+    #[test]
+    fn same_account_refuses_a_renamed_or_replaced_wallet() {
+        use minotari_wallet::db::{create_account, get_account_by_name};
+        use tari_common_types::seeds::cipher_seed::CipherSeed;
+        use tari_transaction_components::key_manager::wallet_types::{SeedWordsWallet, WalletType};
+
+        let (_dir, pool, _) = funded_account("pass");
+        let conn = pool.get().unwrap();
+        let id = get_account_by_name(&conn, "test").unwrap().unwrap().id;
+        same_account(&conn, "test", id).expect("unchanged");
+
+        conn.execute(
+            "UPDATE accounts SET friendly_name = 'gone' WHERE id = ?1",
+            [id],
         )
         .unwrap();
-        let (pending_id, _) =
-            build_unsigned_transaction(&mut sender, address, MicroMinotari(1_000), None).unwrap();
+        assert_eq!(
+            same_account(&conn, "test", id).unwrap_err().to_string(),
+            "No accounts found for this wallet"
+        );
+        let wallet =
+            WalletType::SeedWords(SeedWordsWallet::construct_new(CipherSeed::random()).unwrap());
+        create_account(&conn, "test", &wallet, "pass").unwrap();
+        assert_eq!(
+            same_account(&conn, "test", id).unwrap_err().to_string(),
+            "Wallet Error: The wallet was renamed or replaced; try again"
+        );
+    }
 
-        drop(conn);
-        (dir, pool, output_id, pending_id)
+    /// A lock between loading the signing keys and building the transaction: the build
+    /// re-reads the keys with an empty passphrase. For an empty-passphrase wallet that
+    /// fallback succeeds, and for any other it fails to decrypt; either way the send
+    /// reports `Wallet is locked` and leaves no UTXO reserved.
+    #[tokio::test]
+    async fn a_lock_before_the_build_is_locked_and_reserves_nothing() {
+        use crate::api::db::{
+            lock_wallet, set_database_path, unlock_wallet, GLOBAL_STATE_TEST_LOCK,
+        };
+
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        for passphrase in ["", "pass"] {
+            let (dir, pool, output_id) = funded_account(passphrase);
+            let path = dir.path().join("wallet.db").to_string_lossy().into_owned();
+            set_database_path(path.clone()).unwrap();
+            unlock_wallet(path, "test".into(), passphrase.into()).unwrap();
+            stored_key_manager("test").expect("unlocked: the keys load");
+            let mut sender =
+                create_transaction_sender("test", Network::LocalNet, 3, SEND_FEE_PER_GRAM).unwrap();
+            let address = minotari_wallet::db::get_account_by_name(&pool.get().unwrap(), "test")
+                .unwrap()
+                .unwrap()
+                .get_address(Network::LocalNet, passphrase)
+                .unwrap();
+
+            assert!(lock_wallet("test".into()).await.unwrap());
+            let recipient = Recipient {
+                address,
+                amount: MicroMinotari(1_000),
+                payment_id: None,
+            };
+            let Err(err) = build_while_unlocked(&mut sender, "test", vec![recipient], false, None)
+            else {
+                panic!("a send after a lock must not build (passphrase {passphrase:?})");
+            };
+            assert_eq!(
+                err.to_string(),
+                "Wallet is locked",
+                "passphrase {passphrase:?}"
+            );
+            assert_eq!(
+                output_status(&pool.get().unwrap(), output_id),
+                "UNSPENT",
+                "no reservation left (passphrase {passphrase:?})"
+            );
+        }
     }
 
     fn output_status(conn: &r2d2_sqlite::rusqlite::Connection, output_id: i64) -> String {
@@ -911,26 +1565,6 @@ mod tests {
     }
 
     #[test]
-    fn expiry_sweep_never_releases_inputs_of_a_recorded_send() {
-        let (_dir, pool, output_id, pending_id) = reserve_one_output();
-        let conn = pool.get().unwrap();
-
-        // Recording a send completes its reservation, even while the displayed
-        // transaction is Pending node acceptance. Those inputs cannot be reused.
-        conn.execute(
-            "UPDATE pending_transactions SET status = 'COMPLETED', \
-             expires_at = '2000-01-01 00:00:00' WHERE id = ?1",
-            [&pending_id],
-        )
-        .unwrap();
-
-        crate::api::db::release_expired_reservations(&conn);
-        assert_eq!(output_status(&conn, output_id), "LOCKED");
-        assert!(!expire_and_unlock_pending_transaction(&conn, &pending_id).unwrap());
-        assert_eq!(output_status(&conn, output_id), "LOCKED");
-    }
-
-    #[test]
     fn adapter_resolves_network_and_passes_through_valid_inputs() {
         let details = details_with(
             deterministic_recipient_base58(Network::MainNet),
@@ -938,8 +1572,207 @@ mod tests {
             None,
         );
         let validated = validate_inputs(&details).expect("valid inputs must succeed");
-        assert_eq!(validated.amount, MicroMinotari(1_000));
+        assert_eq!(validated.recipients.len(), 1);
+        assert_eq!(validated.recipients[0].amount, MicroMinotari(1_000));
         // Proves the adapter resolved `Some(MainNet)` via `parse_network`.
         assert_eq!(validated.network, Network::MainNet);
+        assert_eq!(validated.confirmations, DEFAULT_CONFIRMATION_WINDOW);
+    }
+
+    /// `conflicts_with_transaction_id`: `None` asks for no conflict; a number is the
+    /// abandoned send's id; anything else is refused before any UTXO is reserved, with
+    /// the same string as `abandon_send`.
+    #[test]
+    fn conflicts_with_transaction_id_is_parsed_as_a_transaction_id() {
+        let good = deterministic_recipient_base58(Network::MainNet);
+        let mut details = details_with(good, 1_000, None);
+        let validated = validate_inputs(&details).expect("no conflict asked for");
+        assert_eq!(validated.conflicts_with, None);
+
+        details.conflicts_with_transaction_id = Some("42".to_string());
+        let validated = validate_inputs(&details).expect("a numeric id");
+        assert_eq!(validated.conflicts_with, Some(TxId::from(42u64)));
+
+        for bad in ["", "abc", "-1", "4 2", "18446744073709551616"] {
+            details.conflicts_with_transaction_id = Some(bad.to_string());
+            let Err(err) = validate_inputs(&details) else {
+                panic!("{bad:?} is no transaction id");
+            };
+            assert_eq!(
+                err.to_string(),
+                "Wallet Error: Invalid transaction id",
+                "{bad:?}"
+            );
+        }
+
+        // A bad recipient is reported first, as before the field existed.
+        details.recipients[0].address = "not-a-valid-base58-address".to_string();
+        let Err(err) = validate_inputs(&details) else {
+            panic!("a bad recipient must be rejected");
+        };
+        assert!(err.to_string().starts_with("Invalid Recipient Address: "));
+    }
+
+    /// CONTRACT: the three Dart-visible refusals of a conflicting resend.
+    #[test]
+    fn resend_refusal_strings_are_frozen() {
+        assert_eq!(
+            WalletError::wallet(NOT_AN_ABANDONED_SEND).to_string(),
+            "Wallet Error: The transaction to conflict with is not an abandoned send of this wallet"
+        );
+        assert_eq!(
+            WalletError::wallet(NO_SPENDABLE_RELEASED_INPUT).to_string(),
+            "Wallet Error: None of the abandoned send's inputs can be spent; check the wallet's transactions before paying again"
+        );
+        assert_eq!(
+            WalletError::wallet(RESEND_DOES_NOT_CONFLICT).to_string(),
+            "Wallet Error: The resend does not conflict with the abandoned send"
+        );
+    }
+
+    /// A send id the account does not have is no abandoned send of it.
+    #[test]
+    fn resolve_conflict_refuses_an_unknown_send() {
+        let (_dir, pool, _) = funded_account("pass");
+        let conn = pool.get().unwrap();
+        let account_id = minotari_wallet::db::get_account_by_name(&conn, "test")
+            .unwrap()
+            .unwrap()
+            .id;
+        let Err(err) = resolve_conflict(&conn, account_id, TxId::from(999u64), 3) else {
+            panic!("an unknown send must be refused");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Wallet Error: The transaction to conflict with is not an abandoned send of this wallet"
+        );
+    }
+
+    /// The defence-in-depth check before signing: a built send that shares no input
+    /// with the abandoned one is refused and its reservation released; one that shares
+    /// an input passes and keeps it.
+    #[tokio::test]
+    async fn a_resend_sharing_no_input_is_refused_and_released() {
+        use crate::api::db::{set_database_path, GLOBAL_STATE_TEST_LOCK};
+
+        let _guard = GLOBAL_STATE_TEST_LOCK.lock().await;
+        let (dir, pool, output_id) = funded_account("pass");
+        let path = dir.path().join("wallet.db").to_string_lossy().into_owned();
+        set_database_path(path).unwrap();
+        let conn = pool.get().unwrap();
+        let account = minotari_wallet::db::get_account_by_name(&conn, "test")
+            .unwrap()
+            .unwrap();
+        let mut sender = TransactionSender::new(
+            pool.clone(),
+            "test".to_string(),
+            Zeroizing::new("pass".to_string()),
+            Network::LocalNet,
+            3,
+        )
+        .unwrap();
+        let recipient = Recipient {
+            address: account.get_address(Network::LocalNet, "pass").unwrap(),
+            amount: MicroMinotari(1_000),
+            payment_id: None,
+        };
+        let (pending_id, unsigned_tx) =
+            build_unsigned_transaction(&mut sender, vec![recipient], false, Some(&[output_id]))
+                .unwrap();
+        assert_eq!(output_status(&conn, output_id), "LOCKED");
+        let spent = output_hash(&conn, account.id, output_id).unwrap();
+
+        let shares = Conflict {
+            required_inputs: vec![output_id],
+            original_inputs: vec![vec![9u8; 32], spent],
+        };
+        ensure_conflicts(&unsigned_tx, &shares, &pending_id).expect("shares an input");
+        assert_eq!(output_status(&conn, output_id), "LOCKED");
+
+        let disjoint = Conflict {
+            required_inputs: vec![output_id],
+            original_inputs: vec![vec![9u8; 32]],
+        };
+        let err =
+            ensure_conflicts(&unsigned_tx, &disjoint, &pending_id).expect_err("shares no input");
+        assert_eq!(
+            err.to_string(),
+            "Wallet Error: The resend does not conflict with the abandoned send"
+        );
+        assert_eq!(
+            output_status(&conn, output_id),
+            "UNSPENT",
+            "the reservation is released"
+        );
+    }
+
+    #[test]
+    fn adapter_honours_explicit_confirmation_window() {
+        let details = details_with(
+            deterministic_recipient_base58(Network::MainNet),
+            1_000,
+            Some(12),
+        );
+        let validated = validate_inputs(&details).expect("valid inputs must succeed");
+        assert_eq!(validated.confirmations, 12);
+    }
+
+    #[test]
+    fn multi_send_validates_every_recipient() {
+        let good = deterministic_recipient_base58(Network::MainNet);
+        let mut details = details_with(good.clone(), 1_000, None);
+        details.recipients.push(SendRecipient {
+            address: good.clone(),
+            amount: 2_000,
+            payment_id: Some("second".to_string()),
+        });
+        let validated = validate_inputs(&details).expect("two good recipients");
+        assert_eq!(validated.recipients.len(), 2);
+        assert_eq!(validated.recipients[1].amount, MicroMinotari(2_000));
+        assert_eq!(
+            validated.recipients[1].payment_id.as_deref(),
+            Some("second")
+        );
+
+        // A bad second recipient fails the whole send with the frozen prefix.
+        details.recipients[1].address = "not-a-valid-base58-address".to_string();
+        let Err(err) = validate_inputs(&details) else {
+            panic!("a bad second recipient must be rejected");
+        };
+        assert!(
+            err.to_string().starts_with("Invalid Recipient Address: "),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn send_all_ignores_amount_but_needs_exactly_one_recipient() {
+        let good = deterministic_recipient_base58(Network::MainNet);
+        let mut details = details_with(good.clone(), 0, None);
+        details.send_all = true;
+        assert!(validate_inputs(&details).is_ok(), "send-all ignores amount");
+
+        details.recipients.push(SendRecipient {
+            address: good,
+            amount: 0,
+            payment_id: None,
+        });
+        let Err(err) = validate_inputs(&details) else {
+            panic!("send-all to two recipients must be rejected");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Wallet Error: A send-all pays exactly one recipient"
+        );
+
+        details.recipients.clear();
+        details.send_all = false;
+        let Err(err) = validate_inputs(&details) else {
+            panic!("no recipients must be rejected");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Wallet Error: At least one recipient is required"
+        );
     }
 }
